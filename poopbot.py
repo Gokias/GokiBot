@@ -47,17 +47,11 @@ CONGRATS = [
     "Delivery confirmed, {user}.",
     "Another successful drop, {user}.",
     "System pressure normalized, {user}.",
-    "Operational success, {user}.",
-    "Flow restored. Nice work, {user}.",
     "Pipeline cleared efficiently, {user}.",
     "That went exactly as planned, {user}.",
     "Another smooth release, {user}.",
     "Containment breach resolved, {user}.",
-    "Throughput exceeded expectations, {user}.",
-    "Release window utilized perfectly, {user}.",
-    "Payload offloaded successfully, {user}.",
     "Stability restored, {user}.",
-    "System latency reduced to zero, {user}.",
     "Another clean transfer, {user}.",
     "Gravity assisted as expected, {user}.",
     "Pressure differential resolved, {user}.",
@@ -73,157 +67,96 @@ CONGRATS = [
     "Exit strategy performed without issue, {user}.",
     "Nothing backed up this time, {user}.",
     "Flow rate acceptable, {user}.",
-    
-    # First 30
     "Mission accomplished, {user}. 💩",
-    "Another successful delivery, {user}.",
-    "Nature has been served. Well done, {user}.",
+    "Nature called and {user} answered with vigor.",
     "A job well done, {user}. Flush with pride.",
     "Textbook execution, {user}.",
-    "Certified drop-off complete, {user}.",
-    "Smooth operation, {user}.",
     "Excellent form, {user}.",
     "Another one in the books, {user}.",
     "Poop status: logged. Nice work, {user}.",
     "Handled with precision, {user}.",
     "Clean break. Strong showing, {user}.",
     "That’s how it’s done, {user}.",
-    "Release achieved. Congrats, {user}.",
     "Well timed and well placed, {user}.",
-    "Efficiency at its finest, {user}.",
     "Successful payload delivery, {user}.",
-    "A flawless run, {user}.",
     "Poop confirmed. Solid work, {user}.",
     "Gravity remains undefeated, {user}.",
-    "Form, function, fulfillment — nice one, {user}.",
     "Another victory for biology, {user}.",
-    "Operation Flushpoint completed, {user}.",
-    "Clean exit. Professional work, {user}.",
-    "Your body thanks you, {user}.",
     "Another log logged, {user}.",
-    "Nature called. You answered, {user}.",
     "One small dump for man, one giant relief for {user}.",
     "Poop cycle complete. Well done, {user}.",
     "Balance restored. Nice work, {user}.",
-    # Second 30
     "All systems go. Nice dump, {user}.",
     "Another successful evacuation, {user}.",
     "Release valve opened flawlessly, {user}.",
-    "Throughput achieved. Well done, {user}.",
     "Nothing left behind. Strong work, {user}.",
     "Clean operation from start to finish, {user}.",
-    "Payload delivered on schedule, {user}.",
-    "Stress relieved. Mission complete, {user}.",
-    "Peak performance achieved, {user}.",
     "System integrity maintained. Nice one, {user}.",
-    "Flow state reached, {user}.",
     "Successful offload confirmed, {user}.",
-    "Poop pipeline functioning optimally, {user}.",
     "Another blockage cleared, {user}.",
-    "Excellent timing, excellent release, {user}.",
     "Process completed without incident, {user}.",
     "That’s one for the records, {user}.",
-    "Optimal evacuation confirmed, {user}.",
     "Well executed exit strategy, {user}.",
-    "Biomechanics win again. Congrats, {user}.",
-    "Another pressure cycle resolved, {user}.",
     "All clear. Nice work, {user}.",
-    "Successful transfer to porcelain, {user}.",
-    "Relief level: maximum. Good job, {user}.",
     "System reset complete, {user}.",
-    "Another clean handoff, {user}.",
-    "Your digestive tract salutes you, {user}.",
-    "Another load successfully shed, {user}.",
-    "Completion achieved. Stand proud, {user}.",
     "Poop event recorded. Excellent, {user}.",
+
+    "Mission accomplished, but at what cost, {user}.",
+    "Payload delivered… with collateral damage, {user}.",
+    "Successful deployment; splash radius exceeded expectations, {user}.",
+    "Package received, but the landing was rough, {user}.",
+    "Delivery confirmed. The aftermath was… extensive, {user}.",
+    "Release achieved; turbulence reported on final approach, {user}.",
+    "Transfer completed with unexpected turbulence, {user}.",
+    "Process completed; residue levels remain concerning, {user}.",
+    "Outcome delivered, but the wipe budget doubled, {user}.",
+    "Release completed—-friction heat noted, {user}.",
+    "Primary objective met; secondary objectives failed, {user}.",
+    "Release finished; splashback event recorded, {user}.",
+    "Event completed; flush count higher than planned, {user}.",
+    "Operation successful. Multiple passes required, {user}.",
+    "Release confirmed. That was a high-friction exit, {user}.",
+    "Output achieved; the situation got spicy, {user}.",
+    "Task finished. The final seconds were a gamble, {user}.",
+    "All done, {user}. Nobody’s calling that a clean run.",
+
 
     # Dota 2
     "Space created, {user}.",
-    "Objective secured, {user}.",
-    "That’s value, {user}.",
-    "Clean disengage, {user}.",
-    "Perfect timing window, {user}.",
-    "Map control restored, {user}.",
-    "Tempo maintained, {user}.",
-    "Nicely played around cooldowns, {user}.",
-    "Big impact, low commitment — well played, {user}.",
-    "Another successful rotation, {user}.",
-
+    
     # Arc Raiders
     "Extraction successful, {user}.",
-    "Threat neutralized, {user}.",
-    "Clean run, no alarms, {user}.",
-    "Another survival secured, {user}.",
-    "Resources recovered intact, {user}.",
-
+    
     # Factorio
-    "Throughput optimized, {user}.",
     "Bottleneck resolved, {user}.",
-    "Ratios restored, {user}.",
-    "The factory grows… and so do you, {user}.",
-    "Automation wins again, {user}.",
-
+    
     # Battlegrounds
     "Top four secured, {user}.",
     "Clean pivot, {user}.",
-    "That shop cooperated nicely, {user}.",
-    "Scaling achieved, {user}.",
-    "RNG smiled upon you, {user}.",
-
+    
     # WoW
-    "Mechanics respected, {user}.",
-    "Cooldowns well spent, {user}.",
-    "Clean pull, no deaths, {user}.",
-    "Threat managed perfectly, {user}.",
-    "Raid morale improved, {user}.",
-
+    "{user} pulled too much, wipe it up.",
+    
     # PoE
-    "Build online, {user}.",
-    "Atlas progress confirmed, {user}.",
-    "Flasks perfectly managed, {user}.",
-    "Loot explosion justified, {user}.",
-    "Value extracted, {user}.",
-
+    "{user} dropped an ancient orb.",
+    
     # Dwarf Fortress
-    "The fortress endures, {user}.",
-    "No tantrum spiral today, {user}.",
-    "Only a *minor* incident, {user}.",
-    "Engineering marvel achieved, {user}.",
-    "The mountainhome approves, {user}.",
-
+    
     # Minecraft
-    "Redstone behaved, {user}.",
-    "Farm output increased, {user}.",
-    "Nothing fell into lava, {user}.",
-    "Clean build, {user}.",
-    "Spawner efficiency improved, {user}.",
-
+    
     # FFXIV
-    "No vuln stacks — impressive, {user}.",
-    "Rotation stayed intact, {user}.",
     "Limit break well timed, {user}.",
     "Duty complete, {user}.",
-    "Party finder approves, {user}.",
-
+    
     # Diablo
     "Rift cleared efficiently, {user}.",
-    "Legendary justified its drop, {user}.",
-    "Damage numbers felt right, {user}.",
-    "Survivability confirmed, {user}.",
-    "That felt powerful, {user}.",
-
+    
     # OSRS
     "XP waste minimized, {user}.",
-    "RNG finally cooperated, {user}.",
-    "Another KC secured, {user}.",
     "Tick-perfect execution, {user}.",
-    "Drop table acknowledged you, {user}.",
-
+    
     # General
-    "Execution matched the plan, {user}.",
-    "Systems aligned perfectly, {user}.",
     "Another small win logged, {user}.",
-    "That was the correct play, {user}.",
     "Consistency pays off, {user}.",
     "{user} — OVERPOOP!",
     "{user} — POOPTACULAR!",
