@@ -27,6 +27,7 @@ if not TOKEN:
 
 DB_DIR = "db"
 CONFIG_DB_PATH = os.path.join(DB_DIR, "poopbot_config.db")
+CLEANUP_DB_PATH = os.path.join(DB_DIR, "poopbot_cleanup.db")
 
 POOP_EMOJI = "💩"
 UNDO_EMOJI = "🧻"
@@ -222,6 +223,14 @@ def db_config() -> sqlite3.Connection:
     return conn
 
 
+def db_cleanup() -> sqlite3.Connection:
+    os.makedirs(DB_DIR, exist_ok=True)
+    conn = sqlite3.connect(CLEANUP_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    _apply_sqlite_pragmas(conn)
+    return conn
+
+
 def db_path_for_year(year: int) -> str:
     os.makedirs(DB_DIR, exist_ok=True)
     return os.path.join(DB_DIR, f"poopbot_{year}.db")
@@ -251,6 +260,22 @@ def init_config_db():
             key TEXT NOT NULL,
             value TEXT NOT NULL,
             PRIMARY KEY (guild_id, key)
+        );
+        """)
+
+
+def init_cleanup_db():
+    with db_cleanup() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS cleanup_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER,
+            channel_id INTEGER,
+            guild_id INTEGER,
+            user_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL
         );
         """)
 
@@ -388,6 +413,35 @@ async def log_event(
     return event_id
 
 
+async def log_cleanup_message(message: discord.Message):
+    created_at = message.created_at.astimezone(timezone.utc)
+    async with db_write_lock:
+        with db_cleanup() as conn:
+            conn.execute("""
+                INSERT INTO cleanup_messages(
+                    message_id, channel_id, guild_id,
+                    user_id, username, content, created_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                message.id,
+                message.channel.id,
+                message.guild.id if message.guild else None,
+                message.author.id,
+                str(message.author),
+                message.content,
+                created_at.isoformat()
+            ))
+
+    print(
+        "Cleanup message stored:",
+        f"user={message.author} ({message.author.id})",
+        f"channel={message.channel.id}",
+        f"time={created_at.isoformat()}",
+        f"text={message.content!r}"
+    )
+
+
 def find_last_active_poop_event_id(user_id: int, year: int) -> str | None:
     """Most recent POOP in the given year that has NOT been undone by that same user."""
     init_year_db(year)
@@ -482,6 +536,7 @@ async def on_message(message: discord.Message):
     # delete any non-bot message in the cleanup channel
     if message.channel.id == CLEANUP_CHANNEL_ID and not message.author.bot:
         try:
+            await log_cleanup_message(message)
             await message.delete()
         except (discord.Forbidden, discord.HTTPException):
             pass
@@ -737,6 +792,7 @@ async def poopstats(ctx):
 async def on_ready():
     init_config_db()
     init_year_db(current_year_local())
+    init_cleanup_db()
 
     if not daily_midnight_pacific.is_running():
         daily_midnight_pacific.start()
