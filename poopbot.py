@@ -35,6 +35,9 @@ UNDO_EMOJI = "🧻"
 # Deletes ANY non-bot message posted in this channel
 CLEANUP_CHANNEL_ID = 1419130398683959398
 
+# Ticketing configuration
+TICKET_DEV_USER_ID = os.getenv("TICKET_DEV_USER_ID")
+
 # Daily post time (12:00am Pacific)
 TZ_NAME = "America/Los_Angeles"
 
@@ -262,6 +265,18 @@ def init_config_db():
             PRIMARY KEY (guild_id, key)
         );
         """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            requester_id INTEGER NOT NULL,
+            requester_name TEXT NOT NULL,
+            channel_id INTEGER,
+            thread_id INTEGER,
+            created_at_utc TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open'
+        );
+        """)
 
 
 def init_cleanup_db():
@@ -330,6 +345,51 @@ def gget_int(guild_id: int, key: str, default: int = 0) -> int:
 
 def gset_int(guild_id: int, key: str, value: int):
     gset(guild_id, key, str(value))
+
+
+def set_ticket_target(guild_id: int, user_id: int, channel_id: int):
+    gset(guild_id, f"ticket_target_{user_id}", str(channel_id))
+
+
+def get_ticket_target(guild_id: int, user_id: int) -> int | None:
+    value = gget(guild_id, f"ticket_target_{user_id}")
+    try:
+        return int(value) if value else None
+    except ValueError:
+        return None
+
+
+def get_ticket_dev_user_id() -> int | None:
+    if not TICKET_DEV_USER_ID:
+        return None
+    try:
+        return int(TICKET_DEV_USER_ID)
+    except ValueError:
+        return None
+
+
+async def create_ticket_request(guild_id: int, requester_id: int, requester_name: str) -> int:
+    created_at = datetime.now(timezone.utc).isoformat()
+    async with db_write_lock:
+        with db_config() as conn:
+            cur = conn.execute("""
+                INSERT INTO tickets(
+                    guild_id, requester_id, requester_name,
+                    channel_id, thread_id, created_at_utc, status
+                )
+                VALUES (?, ?, ?, NULL, NULL, ?, 'open')
+            """, (guild_id, requester_id, requester_name, created_at))
+            return int(cur.lastrowid)
+
+
+async def update_ticket_request(ticket_id: int, channel_id: int, thread_id: int):
+    async with db_write_lock:
+        with db_config() as conn:
+            conn.execute("""
+                UPDATE tickets
+                SET channel_id=?, thread_id=?
+                WHERE ticket_id=?
+            """, (channel_id, thread_id, ticket_id))
 
 
 def set_guild_channel(guild_id: int, channel_id: int):
@@ -783,6 +843,49 @@ async def poopstats(ctx):
         f"- Latest poop: **{latest_str}**\n"
         f"- Most poops in one day: **{max_day_str}**"
     )
+
+
+@bot.command()
+async def featurerequest(ctx):
+    if ctx.guild is None:
+        await ctx.send("Feature requests can only be created in a server.")
+        return
+
+    dev_user_id = get_ticket_dev_user_id()
+    dev_member = ctx.guild.get_member(dev_user_id) if dev_user_id else None
+
+    try:
+        await ctx.message.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    ticket_id = await create_ticket_request(
+        guild_id=ctx.guild.id,
+        requester_id=ctx.author.id,
+        requester_name=str(ctx.author)
+    )
+    thread_name = f"ticket-{ticket_id}-{ctx.author.name}".lower().replace(" ", "-")
+    ticket_target = await ctx.channel.create_thread(
+        name=thread_name,
+        type=discord.ChannelType.private_thread
+    )
+    await ticket_target.add_user(ctx.author)
+    if dev_member:
+        await ticket_target.add_user(dev_member)
+
+    await update_ticket_request(ticket_id, ctx.channel.id, ticket_target.id)
+    set_ticket_target(ctx.guild.id, ctx.author.id, ticket_target.id)
+
+    dev_mention = dev_member.mention if dev_member else ""
+    mention_line = " ".join(part for part in [ctx.author.mention, dev_mention] if part)
+    prompt_lines = [
+        f"{mention_line} **(Ticket #{ticket_id})**",
+        "**Feature request intake**",
+        "- **What is the feature?**",
+        "- **How do you want to use it?**",
+        "- **Give an example of how it is triggered, what happens, etc.**"
+    ]
+    await ticket_target.send("\n".join(prompt_lines))
 
 
 # =========================
