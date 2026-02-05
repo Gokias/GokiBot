@@ -604,7 +604,9 @@ async def post_button_for_guild(guild_id: int, channel_id: int):
     msg = await channel.send(
         f"💩 **Click here to log a poop** — {local_now.strftime('%Y-%m-%d')} (Pacific)\n"
         f"React {POOP_EMOJI} to log.\n"
-        f"React {UNDO_EMOJI} to undo your most recent log."
+        f"React {UNDO_EMOJI} to undo your most recent log.\n"
+        "Want to see a new feature for the bot? (It doesn't have to be poop-logging related) "
+        "!featurerequest to get started"
     )
     await msg.add_reaction(POOP_EMOJI)
     await msg.add_reaction(UNDO_EMOJI)
