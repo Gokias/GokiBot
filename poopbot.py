@@ -37,6 +37,7 @@ CLEANUP_CHANNEL_ID = 1419130398683959398
 
 # Ticketing configuration
 TICKET_DEV_USER_ID = os.getenv("TICKET_DEV_USER_ID")
+TICKET_ARCHIVE_CHANNEL_ID = os.getenv("TICKET_ARCHIVE_CHANNEL_ID")
 
 # Daily post time (12:00am Pacific)
 TZ_NAME = "America/Los_Angeles"
@@ -273,10 +274,20 @@ def init_config_db():
             requester_name TEXT NOT NULL,
             channel_id INTEGER,
             thread_id INTEGER,
+            archive_thread_id INTEGER,
             created_at_utc TEXT NOT NULL,
+            closed_at_utc TEXT,
             status TEXT NOT NULL DEFAULT 'open'
         );
         """)
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(tickets)").fetchall()
+        }
+        if "archive_thread_id" not in columns:
+            conn.execute("ALTER TABLE tickets ADD COLUMN archive_thread_id INTEGER;")
+        if "closed_at_utc" not in columns:
+            conn.execute("ALTER TABLE tickets ADD COLUMN closed_at_utc TEXT;")
 
 
 def init_cleanup_db():
@@ -368,6 +379,15 @@ def get_ticket_dev_user_id() -> int | None:
         return None
 
 
+def get_ticket_archive_channel_id() -> int | None:
+    if not TICKET_ARCHIVE_CHANNEL_ID:
+        return None
+    try:
+        return int(TICKET_ARCHIVE_CHANNEL_ID)
+    except ValueError:
+        return None
+
+
 async def create_ticket_request(guild_id: int, requester_id: int, requester_name: str) -> int:
     created_at = datetime.now(timezone.utc).isoformat()
     async with db_write_lock:
@@ -390,6 +410,17 @@ async def update_ticket_request(ticket_id: int, channel_id: int, thread_id: int)
                 SET channel_id=?, thread_id=?
                 WHERE ticket_id=?
             """, (channel_id, thread_id, ticket_id))
+
+
+async def close_ticket_request(ticket_id: int, archive_thread_id: int):
+    closed_at = datetime.now(timezone.utc).isoformat()
+    async with db_write_lock:
+        with db_config() as conn:
+            conn.execute("""
+                UPDATE tickets
+                SET archive_thread_id=?, closed_at_utc=?, status='closed'
+                WHERE ticket_id=?
+            """, (archive_thread_id, closed_at, ticket_id))
 
 
 def set_guild_channel(guild_id: int, channel_id: int):
@@ -422,6 +453,16 @@ def get_guild_config(guild_id: int):
             FROM guild_config
             WHERE enabled=1 AND guild_id=?
         """, (guild_id,)).fetchone()
+
+
+def get_ticket_by_thread_id(thread_id: int):
+    with db_config() as conn:
+        return conn.execute("""
+            SELECT ticket_id, guild_id, requester_id, requester_name,
+                   channel_id, thread_id, archive_thread_id, status
+            FROM tickets
+            WHERE thread_id=?
+        """, (thread_id,)).fetchone()
 
 
 # =========================
@@ -886,6 +927,60 @@ async def featurerequest(ctx):
         "- **Give an example of how it is triggered, what happens, etc.**"
     ]
     await ticket_target.send("\n".join(prompt_lines))
+
+
+@bot.command()
+async def closeticket(ctx):
+    if ctx.guild is None:
+        return
+
+    dev_user_id = get_ticket_dev_user_id()
+    if dev_user_id is None or ctx.author.id != dev_user_id:
+        return
+
+    ticket = get_ticket_by_thread_id(ctx.channel.id)
+    if not ticket:
+        await ctx.send("No ticket is associated with this channel.")
+        return
+    if ticket["status"] != "open":
+        await ctx.send(f"Ticket #{ticket['ticket_id']} is already closed.")
+        return
+
+    archive_channel_id = get_ticket_archive_channel_id()
+    if archive_channel_id is None:
+        await ctx.send("Archive channel is not configured.")
+        return
+
+    await ctx.send("🔒 This ticket has been closed and will be archived and deleted in 24h.")
+
+    archive_channel = await bot.fetch_channel(archive_channel_id)
+    thread_name = f"ticket-{ticket['ticket_id']}-archive"
+    archive_thread = await archive_channel.create_thread(
+        name=thread_name,
+        type=discord.ChannelType.private_thread
+    )
+
+    dev_member = archive_channel.guild.get_member(dev_user_id)
+    if dev_member:
+        await archive_thread.add_user(dev_member)
+
+    await archive_thread.send(f"**Ticket #{ticket['ticket_id']} archive**")
+
+    allowed_ids = {ticket["requester_id"], dev_user_id}
+    async for message in ctx.channel.history(oldest_first=True, limit=None):
+        if message.author.id not in allowed_ids:
+            continue
+        content_parts = []
+        if message.content:
+            content_parts.append(message.content)
+        if message.attachments:
+            content_parts.extend(att.url for att in message.attachments)
+        content = "\n".join(content_parts).strip()
+        if not content:
+            continue
+        await archive_thread.send(f"**{message.author.display_name}:** {content}")
+
+    await close_ticket_request(ticket["ticket_id"], archive_thread.id)
 
 
 # =========================
