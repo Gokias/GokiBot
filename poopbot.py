@@ -280,6 +280,15 @@ def init_config_db():
             status TEXT NOT NULL DEFAULT 'open'
         );
         """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_collaborators (
+            ticket_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            added_by_id INTEGER NOT NULL,
+            added_at_utc TEXT NOT NULL,
+            PRIMARY KEY (ticket_id, user_id)
+        );
+        """)
         columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(tickets)").fetchall()
@@ -421,6 +430,21 @@ async def close_ticket_request(ticket_id: int, archive_thread_id: int):
                 SET archive_thread_id=?, closed_at_utc=?, status='closed'
                 WHERE ticket_id=?
             """, (archive_thread_id, closed_at, ticket_id))
+
+
+async def add_ticket_collaborator(ticket_id: int, user_id: int, added_by_id: int):
+    added_at = datetime.now(timezone.utc).isoformat()
+    async with db_write_lock:
+        with db_config() as conn:
+            conn.execute("""
+                INSERT INTO ticket_collaborators(
+                    ticket_id, user_id, added_by_id, added_at_utc
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(ticket_id, user_id) DO UPDATE SET
+                    added_by_id=excluded.added_by_id,
+                    added_at_utc=excluded.added_at_utc
+            """, (ticket_id, user_id, added_by_id, added_at))
 
 
 def set_guild_channel(guild_id: int, channel_id: int):
@@ -926,9 +950,36 @@ async def featurerequest(ctx):
         "**Feature request intake**",
         "- **What is the feature?**",
         "- **How do you want to use it?**",
-        "- **Give an example of how it is triggered, what happens, etc.**"
+        "- **Give an example of how it is triggered, what happens, etc.**",
+        "",
+        "Want to bring someone else in? `!collab @user` in this chat."
     ]
     await ticket_target.send("\n".join(prompt_lines))
+
+
+@bot.command()
+async def collab(ctx, user: discord.Member):
+    if ctx.guild is None:
+        await ctx.send("This command can only be used in a server.")
+        return
+
+    if not isinstance(ctx.channel, discord.Thread):
+        await ctx.send("Please use this command inside a ticket thread.")
+        return
+
+    ticket = get_ticket_by_thread_id(ctx.channel.id)
+    if not ticket:
+        await ctx.send("No ticket is associated with this thread.")
+        return
+
+    try:
+        await ctx.channel.add_user(user)
+    except (discord.Forbidden, discord.HTTPException):
+        await ctx.send("I couldn't add that user to this thread.")
+        return
+
+    await add_ticket_collaborator(ticket["ticket_id"], user.id, ctx.author.id)
+    await ctx.send(f"✅ Added {user.mention} to this ticket thread.")
 
 
 @bot.command()
