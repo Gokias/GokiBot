@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, timezone, date, time as dtime
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 try:
@@ -202,7 +203,7 @@ def current_year_local() -> int:
 # =========================
 intents = discord.Intents.default()
 intents.reactions = True
-intents.message_content = True  # needed for prefix commands like !poopstats, !setpoopchannel
+intents.message_content = True  # needed for cleanup logging
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -630,7 +631,7 @@ async def post_button_for_guild(guild_id: int, channel_id: int):
         f"React {POOP_EMOJI} to log.\n"
         f"React {UNDO_EMOJI} to undo your most recent log.\n"
         "Want to see a new feature for the bot? (It doesn't have to be poop-logging related) "
-        "!featurerequest to get started"
+        "/featurerequest to get started"
     )
     await msg.add_reaction(POOP_EMOJI)
     await msg.add_reaction(UNDO_EMOJI)
@@ -848,43 +849,51 @@ def get_max_poops_in_one_day(user_id: int, year: int) -> tuple[int, str | None]:
 
 
 # =========================
-# COMMANDS
+# COMMANDS (slash)
 # =========================
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setpoopchannel(ctx):
-    if ctx.guild is None:
+@bot.tree.command(name="setpoopchannel", description="Set the poop logging channel for this server.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def setpoopchannel(interaction: discord.Interaction):
+    if interaction.guild is None or interaction.channel is None:
         return
-    set_guild_channel(ctx.guild.id, ctx.channel.id)
-    await ctx.send(f"✅ Poop channel set to {ctx.channel.mention} for this server.")
+    set_guild_channel(interaction.guild.id, interaction.channel.id)
+    await interaction.response.send_message(
+        f"✅ Poop channel set to {interaction.channel.mention} for this server."
+    )
 
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def disablepoop(ctx):
-    if ctx.guild is None:
+@bot.tree.command(name="disablepoop", description="Disable poop posting for this server.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def disablepoop(interaction: discord.Interaction):
+    if interaction.guild is None:
         return
-    disable_guild(ctx.guild.id)
-    await ctx.send("🛑 Poop posting disabled for this server.")
+    disable_guild(interaction.guild.id)
+    await interaction.response.send_message("🛑 Poop posting disabled for this server.")
 
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def debugpoop(ctx):
+@bot.tree.command(name="debugpoop", description="Force-create a new poop button message.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def debugpoop(interaction: discord.Interaction):
     """Force-create a new poop button message in this guild's configured channel."""
-    if ctx.guild is None:
+    if interaction.guild is None:
         return
-    cfg = get_guild_config(ctx.guild.id)
+    cfg = get_guild_config(interaction.guild.id)
     if not cfg:
-        await ctx.send("Run !setpoopchannel in the channel you want first.")
+        await interaction.response.send_message(
+            "Run /setpoopchannel in the channel you want first."
+        )
         return
-    await post_button_for_guild(ctx.guild.id, int(cfg["channel_id"]))
-    await ctx.send("🧪 Debug: recreated poop button.")
+    await post_button_for_guild(interaction.guild.id, int(cfg["channel_id"]))
+    await interaction.response.send_message("🧪 Debug: recreated poop button.")
 
 
-@bot.command()
-async def poopstats(ctx):
-    user_id = ctx.author.id
+@bot.tree.command(name="poopstats", description="Show your poop stats for the current year.")
+@app_commands.guild_only()
+async def poopstats(interaction: discord.Interaction):
+    user_id = interaction.user.id
     year = current_year_local()
 
     total, times, days_elapsed = get_user_year_stats(user_id, year)
@@ -902,8 +911,8 @@ async def poopstats(ctx):
     )
     max_day_str = f"{max_day_count} on {max_day_date}" if max_day_date else "N/A"
 
-    await ctx.send(
-        f"**{ctx.author.mention} — {year} Poop Stats**\n"
+    await interaction.response.send_message(
+        f"**{interaction.user.mention} — {year} Poop Stats**\n"
         f"- Total poops: **{total}**\n"
         f"- Avg poops/day ({year}, since first logged): **{avg_per_day:.3f}**\n"
         f"- Avg local time: **{mean_time_str} Pacific**\n"
@@ -912,39 +921,38 @@ async def poopstats(ctx):
     )
 
 
-@bot.command()
-async def featurerequest(ctx):
-    if ctx.guild is None:
-        await ctx.send("Feature requests can only be created in a server.")
+@bot.tree.command(name="featurerequest", description="Start a feature request ticket.")
+@app_commands.guild_only()
+async def featurerequest(interaction: discord.Interaction):
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message(
+            "Feature requests can only be created in a server.",
+            ephemeral=True
+        )
         return
 
     dev_user_id = get_ticket_dev_user_id()
-    dev_member = ctx.guild.get_member(dev_user_id) if dev_user_id else None
-
-    try:
-        await ctx.message.delete()
-    except (discord.Forbidden, discord.HTTPException):
-        pass
+    dev_member = interaction.guild.get_member(dev_user_id) if dev_user_id else None
 
     ticket_id = await create_ticket_request(
-        guild_id=ctx.guild.id,
-        requester_id=ctx.author.id,
-        requester_name=str(ctx.author)
+        guild_id=interaction.guild.id,
+        requester_id=interaction.user.id,
+        requester_name=str(interaction.user)
     )
-    thread_name = f"ticket-{ticket_id}-{ctx.author.name}".lower().replace(" ", "-")
-    ticket_target = await ctx.channel.create_thread(
+    thread_name = f"ticket-{ticket_id}-{interaction.user.name}".lower().replace(" ", "-")
+    ticket_target = await interaction.channel.create_thread(
         name=thread_name,
         type=discord.ChannelType.private_thread
     )
-    await ticket_target.add_user(ctx.author)
+    await ticket_target.add_user(interaction.user)
     if dev_member:
         await ticket_target.add_user(dev_member)
 
-    await update_ticket_request(ticket_id, ctx.channel.id, ticket_target.id)
-    set_ticket_target(ctx.guild.id, ctx.author.id, ticket_target.id)
+    await update_ticket_request(ticket_id, interaction.channel.id, ticket_target.id)
+    set_ticket_target(interaction.guild.id, interaction.user.id, ticket_target.id)
 
     dev_mention = dev_member.mention if dev_member else ""
-    mention_line = " ".join(part for part in [ctx.author.mention, dev_mention] if part)
+    mention_line = " ".join(part for part in [interaction.user.mention, dev_mention] if part)
     prompt_lines = [
         f"{mention_line} **(Ticket #{ticket_id})**",
         "**Feature request intake**",
@@ -952,59 +960,91 @@ async def featurerequest(ctx):
         "- **How do you want to use it?**",
         "- **Give an example of how it is triggered, what happens, etc.**",
         "",
-        "Want to bring someone else in? `!collab @user` in this chat."
+        "Want to bring someone else in? `/collab @user` in this chat."
     ]
     await ticket_target.send("\n".join(prompt_lines))
+    await interaction.response.send_message(
+        f"✅ Created ticket #{ticket_id} in {ticket_target.mention}.",
+        ephemeral=True
+    )
 
 
-@bot.command()
-async def collab(ctx, user: discord.Member):
-    if ctx.guild is None:
-        await ctx.send("This command can only be used in a server.")
+@bot.tree.command(name="collab", description="Add a collaborator to the current ticket thread.")
+@app_commands.guild_only()
+@app_commands.describe(user="User to add to the ticket thread.")
+async def collab(interaction: discord.Interaction, user: discord.Member):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
         return
 
-    if not isinstance(ctx.channel, discord.Thread):
-        await ctx.send("Please use this command inside a ticket thread.")
+    if not isinstance(interaction.channel, discord.Thread):
+        await interaction.response.send_message(
+            "Please use this command inside a ticket thread.",
+            ephemeral=True
+        )
         return
 
-    ticket = get_ticket_by_thread_id(ctx.channel.id)
+    ticket = get_ticket_by_thread_id(interaction.channel.id)
     if not ticket:
-        await ctx.send("No ticket is associated with this thread.")
+        await interaction.response.send_message(
+            "No ticket is associated with this thread.",
+            ephemeral=True
+        )
         return
 
     try:
-        await ctx.channel.add_user(user)
+        await interaction.channel.add_user(user)
     except (discord.Forbidden, discord.HTTPException):
-        await ctx.send("I couldn't add that user to this thread.")
+        await interaction.response.send_message(
+            "I couldn't add that user to this thread.",
+            ephemeral=True
+        )
         return
 
-    await add_ticket_collaborator(ticket["ticket_id"], user.id, ctx.author.id)
-    await ctx.send(f"✅ Added {user.mention} to this ticket thread.")
+    await add_ticket_collaborator(ticket["ticket_id"], user.id, interaction.user.id)
+    await interaction.response.send_message(
+        f"✅ Added {user.mention} to this ticket thread."
+    )
 
 
-@bot.command()
-async def closeticket(ctx):
-    if ctx.guild is None:
+@bot.tree.command(name="closeticket", description="Close the current ticket thread.")
+@app_commands.guild_only()
+async def closeticket(interaction: discord.Interaction):
+    if interaction.guild is None:
         return
 
     dev_user_id = get_ticket_dev_user_id()
-    if dev_user_id is None or ctx.author.id != dev_user_id:
+    if dev_user_id is None or interaction.user.id != dev_user_id:
         return
 
-    ticket = get_ticket_by_thread_id(ctx.channel.id)
+    ticket = get_ticket_by_thread_id(interaction.channel.id)
     if not ticket:
-        await ctx.send("No ticket is associated with this channel.")
+        await interaction.response.send_message(
+            "No ticket is associated with this channel.",
+            ephemeral=True
+        )
         return
     if ticket["status"] != "open":
-        await ctx.send(f"Ticket #{ticket['ticket_id']} is already closed.")
+        await interaction.response.send_message(
+            f"Ticket #{ticket['ticket_id']} is already closed.",
+            ephemeral=True
+        )
         return
 
     archive_channel_id = get_ticket_archive_channel_id()
     if archive_channel_id is None:
-        await ctx.send("Archive channel is not configured.")
+        await interaction.response.send_message(
+            "Archive channel is not configured.",
+            ephemeral=True
+        )
         return
 
-    await ctx.send("🔒 This ticket has been closed and will be archived and deleted in 24h.")
+    await interaction.response.send_message(
+        "🔒 This ticket has been closed and will be archived and deleted in 24h."
+    )
 
     archive_channel = await bot.fetch_channel(archive_channel_id)
     thread_name = f"ticket-{ticket['ticket_id']}-archive"
@@ -1020,7 +1060,7 @@ async def closeticket(ctx):
     await archive_thread.send(f"**Ticket #{ticket['ticket_id']} archive**")
 
     allowed_ids = {ticket["requester_id"], dev_user_id}
-    async for message in ctx.channel.history(oldest_first=True, limit=None):
+    async for message in interaction.channel.history(oldest_first=True, limit=None):
         if message.author.id not in allowed_ids:
             continue
         content_parts = []
@@ -1036,6 +1076,22 @@ async def closeticket(ctx):
     await close_ticket_request(ticket["ticket_id"], archive_thread.id)
 
 
+@bot.tree.command(name="gokibothelp", description="Show all available GokiBot commands.")
+async def gokibothelp(interaction: discord.Interaction):
+    command_lines = [
+        "**GokiBot Commands**",
+        "- `/setpoopchannel` — Set the poop logging channel (admin only).",
+        "- `/disablepoop` — Disable poop posting (admin only).",
+        "- `/debugpoop` — Force-create a new poop button (admin only).",
+        "- `/poopstats` — Show your poop stats for the year.",
+        "- `/featurerequest` — Start a feature request ticket.",
+        "- `/collab` — Add someone to the current ticket thread.",
+        "- `/closeticket` — Close the current ticket thread.",
+        "- `/gokibothelp` — Show this help message."
+    ]
+    await interaction.response.send_message("\n".join(command_lines), ephemeral=True)
+
+
 # =========================
 # STARTUP
 # =========================
@@ -1044,6 +1100,11 @@ async def on_ready():
     init_config_db()
     init_year_db(current_year_local())
     init_cleanup_db()
+
+    try:
+        await bot.tree.sync()
+    except (discord.HTTPException, discord.Forbidden):
+        pass
 
     if not daily_midnight_pacific.is_running():
         daily_midnight_pacific.start()
