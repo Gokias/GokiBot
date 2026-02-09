@@ -5,6 +5,8 @@ import uuid
 import random
 import sqlite3
 import asyncio
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, date, time as dtime
 
 import discord
@@ -45,6 +47,27 @@ TZ_NAME = "America/Los_Angeles"
 
 # Rotate button message every N poops per guild
 ROTATE_EVERY = 10
+
+WESROTH_HANDLE_URL = "https://www.youtube.com/@WesRoth"
+WESROTH_CHANNEL_ID = os.getenv("WESROTH_CHANNEL_ID")
+WESROTH_ALERT_CHANNEL_ID = 1350269523902857369
+WESROTH_POLL_MINUTES = 30
+WESROTH_CAPTIONS = [
+    "IT BEGINS.",
+    "WE’RE DONE.",
+    "PACK IT UP.",
+    "GAME OVER.",
+    "END OF THE LINE.",
+    "CURTAINS.",
+    "NO TURNING BACK.",
+    "THIS AIN’T GOOD.",
+    "THE END IS NIGH.",
+    "POINT OF NO RETURN.",
+    "HERE WE GO.",
+    "ITS OVER.",
+    "UH OH.",
+    "THIS IS IT.",
+]
 
 # =========================
 # MESSAGES
@@ -180,6 +203,12 @@ UNDO_MSGS = [
     "Wiped from history, {user}.",
     "Deleted one (1) poop from the timeline, {user}.",
 ]
+
+WESROTH_NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "yt": "http://www.youtube.com/xml/schemas/2015",
+    "media": "http://search.yahoo.com/mrss/",
+}
 
 # =========================
 # TIMEZONE
@@ -499,6 +528,109 @@ def now_utc_local():
     return utc, local
 
 
+def _fetch_url_text(url: str) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+    )
+    with urllib.request.urlopen(req, timeout=20) as response:
+        return response.read().decode("utf-8")
+
+
+def _extract_channel_id_from_handle_page(html: str) -> str | None:
+    marker = '"channelId":"'
+    idx = html.find(marker)
+    if idx == -1:
+        return None
+    start = idx + len(marker)
+    end = html.find('"', start)
+    if end == -1:
+        return None
+    return html[start:end]
+
+
+async def resolve_wesroth_channel_id() -> str | None:
+    if WESROTH_CHANNEL_ID:
+        return WESROTH_CHANNEL_ID
+    try:
+        html = await asyncio.to_thread(_fetch_url_text, WESROTH_HANDLE_URL)
+    except OSError as exc:
+        print(f"Failed to fetch WesRoth channel page: {exc}")
+        return None
+    channel_id = _extract_channel_id_from_handle_page(html)
+    if not channel_id:
+        print("Failed to parse WesRoth channel id from handle page.")
+    return channel_id
+
+
+def _parse_wesroth_feed(xml_text: str) -> list[dict]:
+    root = ET.fromstring(xml_text)
+    entries = []
+    for entry in root.findall("atom:entry", WESROTH_NS):
+        video_id = entry.findtext("yt:videoId", default=None, namespaces=WESROTH_NS)
+        published = entry.findtext("atom:published", default=None, namespaces=WESROTH_NS)
+        if not video_id or not published:
+            continue
+        link = None
+        for link_elem in entry.findall("atom:link", WESROTH_NS):
+            if link_elem.get("rel") == "alternate":
+                link = link_elem.get("href")
+                break
+        duration_elem = entry.find("media:group/yt:duration", WESROTH_NS)
+        duration_seconds = None
+        if duration_elem is not None:
+            duration_raw = duration_elem.get("seconds")
+            if duration_raw and duration_raw.isdigit():
+                duration_seconds = int(duration_raw)
+        entries.append({
+            "video_id": video_id,
+            "published": published,
+            "link": link or f"https://www.youtube.com/watch?v={video_id}",
+            "duration_seconds": duration_seconds,
+        })
+    return entries
+
+
+async def fetch_wesroth_latest_today() -> dict | None:
+    channel_id = await resolve_wesroth_channel_id()
+    if not channel_id:
+        return None
+    feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    try:
+        xml_text = await asyncio.to_thread(_fetch_url_text, feed_url)
+    except OSError as exc:
+        print(f"Failed to fetch WesRoth feed: {exc}")
+        return None
+    entries = _parse_wesroth_feed(xml_text)
+    if not entries:
+        return None
+
+    today_local = datetime.now(LOCAL_TZ).date()
+    todays_entries = []
+    for entry in entries:
+        try:
+            published_dt = datetime.fromisoformat(entry["published"].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if published_dt.astimezone(LOCAL_TZ).date() != today_local:
+            continue
+        duration_seconds = entry.get("duration_seconds")
+        if duration_seconds is not None and duration_seconds <= 60:
+            continue
+        entry["published_dt"] = published_dt
+        todays_entries.append(entry)
+
+    if not todays_entries:
+        return None
+
+    return max(todays_entries, key=lambda item: item["published_dt"])
+
+
 async def log_event(
     event_type: str,
     user_id: int,
@@ -654,6 +786,30 @@ async def daily_midnight_pacific():
                 await post_button_for_guild(gid, cid)
         except (discord.Forbidden, discord.NotFound, discord.HTTPException):
             continue
+
+
+@tasks.loop(minutes=WESROTH_POLL_MINUTES)
+async def wesroth_upload_watch():
+    latest = await fetch_wesroth_latest_today()
+    if not latest:
+        return
+
+    last_video_id = gget(0, "wesroth_last_video_id")
+    if last_video_id == latest["video_id"]:
+        return
+
+    channel = bot.get_channel(WESROTH_ALERT_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(WESROTH_ALERT_CHANNEL_ID)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            return
+
+    caption = random.choice(WESROTH_CAPTIONS)
+    await channel.send(f"{caption}\n{latest['link']}")
+
+    gset(0, "wesroth_last_video_id", latest["video_id"])
+    gset(0, "wesroth_last_post_date_local", datetime.now(LOCAL_TZ).date().isoformat())
 
 
 # =========================
@@ -1108,6 +1264,8 @@ async def on_ready():
 
     if not daily_midnight_pacific.is_running():
         daily_midnight_pacific.start()
+    if not wesroth_upload_watch.is_running():
+        wesroth_upload_watch.start()
 
     # If configured guilds haven't posted today, post immediately
     today_local = datetime.now(LOCAL_TZ).date().isoformat()
