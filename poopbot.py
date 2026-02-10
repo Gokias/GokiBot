@@ -392,8 +392,10 @@ async def fetch_track_info(url: str) -> QueueTrack:
     except Exception as exc:
         raise RuntimeError("Unable to read track metadata.") from exc
 
-    title = str(info.get("title") or "Unknown title")
-    duration_seconds = parse_duration_seconds(info.get("duration"))
+    track_info = pick_track_info(info)
+
+    title = str(track_info.get("title") or "Unknown title")
+    duration_seconds = parse_duration_seconds(track_info.get("duration"))
     if duration_seconds <= 0:
         duration_seconds = parse_duration_seconds(info.get("duration_string"))
     webpage_url = str(info.get("webpage_url") or url)
