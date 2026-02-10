@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, date, time as dtime
+import time
 
 import discord
 from discord import app_commands
@@ -72,6 +73,15 @@ WESROTH_CAPTIONS = [
     "UH OH.",
     "THIS IS IT.",
 ]
+
+FETCH_TRACK_INFO_TIMEOUT_SECONDS = 25
+RESOLVE_STREAM_URL_TIMEOUT_SECONDS = 25
+FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
+    "Timed out while fetching track info from YouTube. Please try again in a moment."
+)
+RESOLVE_STREAM_URL_TIMEOUT_MESSAGE = (
+    "Timed out while preparing audio stream from YouTube. Skipping this track."
+)
 
 # =========================
 # MESSAGES
@@ -305,6 +315,13 @@ def parse_duration_seconds(value: object) -> int:
     return total
 
 
+def log_music_timing(step: str, phase: str, started_at: float, **fields: object):
+    elapsed = time.perf_counter() - started_at
+    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    suffix = f" {details}" if details else ""
+    print(f"[music] {step} {phase} elapsed={elapsed:.2f}s{suffix}")
+
+
 async def fetch_track_info(url: str) -> QueueTrack:
 
     info_proc = await asyncio.create_subprocess_exec(
@@ -437,6 +454,7 @@ async def play_next_track(guild: discord.Guild):
         except Exception as exc:
             print(f"Failed to start next track: {exc}")
 
+    print(f"[music] voice_client.play start track='{next_track.title}'")
     voice_client.play(ffmpeg_source, after=_after_playback)
 
 
@@ -1480,7 +1498,15 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
             return
 
     try:
-        track = await fetch_track_info(source)
+        track = await asyncio.wait_for(
+            fetch_track_info(source),
+            timeout=FETCH_TRACK_INFO_TIMEOUT_SECONDS,
+        )
+        log_music_timing("fetch_track_info", "end", fetch_started_at, source=source)
+    except asyncio.TimeoutError:
+        log_music_timing("fetch_track_info", "timeout", fetch_started_at, source=source)
+        await interaction.followup.send(FETCH_TRACK_INFO_TIMEOUT_MESSAGE, ephemeral=True)
+        return
     except RuntimeError as exc:
         await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
         return
