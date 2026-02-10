@@ -6,7 +6,11 @@ import random
 import sqlite3
 import asyncio
 import urllib.request
+import shutil
+import json
 import xml.etree.ElementTree as ET
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone, date, time as dtime
 
 import discord
@@ -238,6 +242,190 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # serialize DB writes to avoid sqlite "database is locked"
 db_write_lock = asyncio.Lock()
+
+MUSIC_DIR = "tmp_audio"
+
+
+@dataclass
+class QueueTrack:
+    title: str
+    source_url: str
+    duration_seconds: int
+    file_path: str
+    requested_by: int
+
+
+class GuildMusicState:
+    def __init__(self):
+        self.queue: deque[QueueTrack] = deque()
+        self.current_track: QueueTrack | None = None
+        self.track_started_at: datetime | None = None
+        self.lock = asyncio.Lock()
+
+
+music_states: dict[int, GuildMusicState] = {}
+
+
+def get_music_state(guild_id: int) -> GuildMusicState:
+    state = music_states.get(guild_id)
+    if state is None:
+        state = GuildMusicState()
+        music_states[guild_id] = state
+    return state
+
+
+def format_duration(duration_seconds: int) -> str:
+    mins, secs = divmod(max(duration_seconds, 0), 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours:d}:{mins:02d}:{secs:02d}"
+    return f"{mins:d}:{secs:02d}"
+
+
+def get_missing_media_dependencies() -> list[str]:
+    missing: list[str] = []
+    if shutil.which("yt-dlp") is None:
+        missing.append("yt-dlp")
+    if shutil.which("ffmpeg") is None:
+        missing.append("ffmpeg")
+    return missing
+
+
+def format_missing_dependency_message(missing: list[str]) -> str:
+    joined = ", ".join(f"`{dep}`" for dep in missing)
+    return (
+        "Music playback is not available because required dependency "
+        f"{joined} is not installed on the bot host."
+    )
+
+
+async def fetch_track_info_and_audio(url: str) -> QueueTrack:
+    os.makedirs(MUSIC_DIR, exist_ok=True)
+    unique_id = uuid.uuid4().hex
+    output_template = os.path.join(MUSIC_DIR, f"{unique_id}.%(ext)s")
+
+    try:
+        info_proc = await asyncio.create_subprocess_exec(
+            "yt-dlp",
+            "--dump-single-json",
+            "--no-playlist",
+            url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("yt-dlp is not installed on this host.") from exc
+    info_stdout, info_stderr = await info_proc.communicate()
+    if info_proc.returncode != 0:
+        err = info_stderr.decode("utf-8", errors="ignore").strip() or "yt-dlp failed"
+        raise RuntimeError(err)
+
+    try:
+        info = json.loads(info_stdout.decode("utf-8", errors="ignore"))
+    except Exception as exc:
+        raise RuntimeError("Unable to read track metadata.") from exc
+
+    title = str(info.get("title") or "Unknown title")
+    duration_seconds = int(info.get("duration") or 0)
+    webpage_url = str(info.get("webpage_url") or url)
+
+    try:
+        dl_proc = await asyncio.create_subprocess_exec(
+            "yt-dlp",
+            "-f",
+            "bestaudio/best",
+            "--no-playlist",
+            "-o",
+            output_template,
+            webpage_url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("yt-dlp is not installed on this host.") from exc
+    _, dl_stderr = await dl_proc.communicate()
+    if dl_proc.returncode != 0:
+        err = dl_stderr.decode("utf-8", errors="ignore").strip() or "Audio download failed"
+        raise RuntimeError(err)
+
+    files = [
+        os.path.join(MUSIC_DIR, name)
+        for name in os.listdir(MUSIC_DIR)
+        if name.startswith(f"{unique_id}.")
+    ]
+    if not files:
+        raise RuntimeError("Downloaded file not found.")
+
+    return QueueTrack(
+        title=title,
+        source_url=webpage_url,
+        duration_seconds=duration_seconds,
+        file_path=files[0],
+        requested_by=0,
+    )
+
+
+async def ensure_voice_channel(interaction: discord.Interaction) -> discord.VoiceChannel | None:
+    if interaction.guild is None:
+        return None
+    member = interaction.guild.get_member(interaction.user.id)
+    if member is None or member.voice is None or member.voice.channel is None:
+        return None
+    if not isinstance(member.voice.channel, discord.VoiceChannel):
+        return None
+    return member.voice.channel
+
+
+async def play_next_track(guild: discord.Guild):
+    voice_client = guild.voice_client
+    if voice_client is None:
+        return
+
+    state = get_music_state(guild.id)
+    async with state.lock:
+        if voice_client.is_playing() or voice_client.is_paused():
+            return
+
+        if not state.queue:
+            state.current_track = None
+            state.track_started_at = None
+            await voice_client.disconnect(force=True)
+            return
+
+        next_track = state.queue.popleft()
+        state.current_track = next_track
+        state.track_started_at = datetime.now(timezone.utc)
+
+    try:
+        ffmpeg_source = discord.FFmpegPCMAudio(next_track.file_path)
+    except FileNotFoundError:
+        print("Playback error: ffmpeg is not installed on this host")
+        try:
+            if os.path.exists(next_track.file_path):
+                os.remove(next_track.file_path)
+        except OSError:
+            pass
+        async with state.lock:
+            state.current_track = None
+            state.track_started_at = None
+        await voice_client.disconnect(force=True)
+        return
+
+    def _after_playback(play_error: Exception | None):
+        if play_error:
+            print(f"Playback error: {play_error}")
+        try:
+            if os.path.exists(next_track.file_path):
+                os.remove(next_track.file_path)
+        except OSError:
+            pass
+        fut = asyncio.run_coroutine_threadsafe(play_next_track(guild), bot.loop)
+        try:
+            fut.result()
+        except Exception as exc:
+            print(f"Failed to start next track: {exc}")
+
+    voice_client.play(ffmpeg_source, after=_after_playback)
 
 
 # =========================
@@ -1232,19 +1420,181 @@ async def closeticket(interaction: discord.Interaction):
     await close_ticket_request(ticket["ticket_id"], archive_thread.id)
 
 
+
+
+def is_dev_user(user_id: int) -> bool:
+    dev_user_id = get_ticket_dev_user_id()
+    return bool(dev_user_id and user_id == dev_user_id)
+
+
+@app_commands.guild_only()
+@bot.tree.command(name="gplay", description="Queue and play audio from a YouTube link.")
+@app_commands.describe(youtube_link="A YouTube video URL.")
+async def gplay(interaction: discord.Interaction, youtube_link: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    voice_channel = await ensure_voice_channel(interaction)
+    if voice_channel is None:
+        await interaction.response.send_message(
+            "You must be in a voice channel to use this command.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    missing_dependencies = get_missing_media_dependencies()
+    if missing_dependencies:
+        await interaction.followup.send(
+            format_missing_dependency_message(missing_dependencies),
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild.voice_client and interaction.guild.voice_client.channel != voice_channel:
+        await interaction.followup.send(
+            f"You must be in {interaction.guild.voice_client.channel.mention} to control playback.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        track = await fetch_track_info_and_audio(youtube_link)
+    except RuntimeError as exc:
+        await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
+        return
+
+    track.requested_by = interaction.user.id
+
+    state = get_music_state(interaction.guild.id)
+    async with state.lock:
+        state.queue.append(track)
+        queue_position = len(state.queue)
+
+    if interaction.guild.voice_client is None:
+        try:
+            await voice_channel.connect()
+        except discord.DiscordException as exc:
+            await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
+            return
+
+    await play_next_track(interaction.guild)
+
+    await interaction.followup.send(
+        f"Queued **{track.title}** ({format_duration(track.duration_seconds)}). Position in queue: **{queue_position}**.",
+        ephemeral=True
+    )
+
+
+@app_commands.guild_only()
+@bot.tree.command(name="gqueue", description="Show the current playback queue.")
+async def gqueue(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    voice_channel = await ensure_voice_channel(interaction)
+    if voice_channel is None:
+        await interaction.response.send_message(
+            "You must be in a voice channel to use this command.",
+            ephemeral=True
+        )
+        return
+
+    vc = interaction.guild.voice_client
+    if vc is not None and vc.channel != voice_channel:
+        await interaction.response.send_message(
+            f"You must be in {vc.channel.mention} to view this queue.",
+            ephemeral=True
+        )
+        return
+
+    state = get_music_state(interaction.guild.id)
+    async with state.lock:
+        current_track = state.current_track
+        started_at = state.track_started_at
+        queued_tracks = list(state.queue)
+
+    lines = ["**Goki Queue**"]
+    if current_track:
+        elapsed = 0
+        if started_at is not None:
+            elapsed = int((datetime.now(timezone.utc) - started_at).total_seconds())
+        lines.append(
+            f"Now playing: **{current_track.title}** [{format_duration(elapsed)} / {format_duration(current_track.duration_seconds)}]"
+        )
+    else:
+        lines.append("Now playing: *(nothing)*")
+
+    if queued_tracks:
+        lines.append("\n**Up next:**")
+        for i, track in enumerate(queued_tracks, start=1):
+            lines.append(f"{i}. {track.title} ({format_duration(track.duration_seconds)})")
+    else:
+        lines.append("\nQueue is empty.")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@app_commands.guild_only()
+@bot.tree.command(name="gskip", description="Skip the currently playing track.")
+async def gskip(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    voice_channel = await ensure_voice_channel(interaction)
+    if voice_channel is None:
+        await interaction.response.send_message(
+            "You must be in a voice channel to use this command.",
+            ephemeral=True
+        )
+        return
+
+    vc = interaction.guild.voice_client
+    if vc is None or not vc.is_connected():
+        await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+        return
+
+    if vc.channel != voice_channel:
+        await interaction.response.send_message(
+            f"You must be in {vc.channel.mention} to skip tracks.",
+            ephemeral=True
+        )
+        return
+
+    if not vc.is_playing() and not vc.is_paused():
+        await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+        return
+
+    vc.stop()
+    await interaction.response.send_message("⏭️ Skipped current track.", ephemeral=True)
+
 @bot.tree.command(name="gokibothelp", description="Show all available GokiBot commands.")
 async def gokibothelp(interaction: discord.Interaction):
     command_lines = [
         "**GokiBot Commands**",
-        "- `/setpoopchannel` — Set the poop logging channel (admin only).",
-        "- `/disablepoop` — Disable poop posting (admin only).",
-        "- `/debugpoop` — Force-create a new poop button (admin only).",
         "- `/poopstats` — Show your poop stats for the year.",
         "- `/featurerequest` — Start a feature request ticket.",
         "- `/collab` — Add someone to the current ticket thread.",
-        "- `/closeticket` — Close the current ticket thread.",
+        "- `/gplay <youtube_link>` — Queue and play YouTube audio.",
+        "- `/gqueue` — Show the current playback queue.",
+        "- `/gskip` — Skip the currently playing track.",
         "- `/gokibothelp` — Show this help message."
     ]
+
+    if is_dev_user(interaction.user.id):
+        command_lines.extend([
+            "",
+            "**Dev/Admin Commands**",
+            "- `/setpoopchannel` — Set the poop logging channel (admin only).",
+            "- `/disablepoop` — Disable poop posting (admin only).",
+            "- `/debugpoop` — Force-create a new poop button (admin only).",
+            "- `/closeticket` — Close the current ticket thread (dev only)."
+        ])
+
     await interaction.response.send_message("\n".join(command_lines), ephemeral=True)
 
 
