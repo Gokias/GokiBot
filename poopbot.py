@@ -1497,6 +1497,7 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
             await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
             return
 
+    fetch_started_at = time.perf_counter()
     try:
         track = await asyncio.wait_for(
             fetch_track_info(source),
