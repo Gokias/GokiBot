@@ -243,7 +243,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # serialize DB writes to avoid sqlite "database is locked"
 db_write_lock = asyncio.Lock()
 
-MUSIC_DIR = "tmp_audio"
 
 
 @dataclass
@@ -251,7 +250,6 @@ class QueueTrack:
     title: str
     source_url: str
     duration_seconds: int
-    file_path: str
     requested_by: int
 
 
@@ -282,10 +280,31 @@ def format_duration(duration_seconds: int) -> str:
     return f"{mins:d}:{secs:02d}"
 
 
-async def fetch_track_info_and_audio(url: str) -> QueueTrack:
-    os.makedirs(MUSIC_DIR, exist_ok=True)
-    unique_id = uuid.uuid4().hex
-    output_template = os.path.join(MUSIC_DIR, f"{unique_id}.%(ext)s")
+def parse_duration_seconds(value: object) -> int:
+    if isinstance(value, (int, float)):
+        return max(int(value), 0)
+
+    if not isinstance(value, str):
+        return 0
+
+    text = value.strip()
+    if not text:
+        return 0
+
+    if text.isdigit():
+        return int(text)
+
+    parts = text.split(":")
+    if not all(part.isdigit() for part in parts):
+        return 0
+
+    total = 0
+    for part in parts:
+        total = (total * 60) + int(part)
+    return total
+
+
+async def fetch_track_info(url: str) -> QueueTrack:
 
     info_proc = await asyncio.create_subprocess_exec(
         "yt-dlp",
@@ -306,40 +325,39 @@ async def fetch_track_info_and_audio(url: str) -> QueueTrack:
         raise RuntimeError("Unable to read track metadata.") from exc
 
     title = str(info.get("title") or "Unknown title")
-    duration_seconds = int(info.get("duration") or 0)
+    duration_seconds = parse_duration_seconds(info.get("duration"))
+    if duration_seconds <= 0:
+        duration_seconds = parse_duration_seconds(info.get("duration_string"))
     webpage_url = str(info.get("webpage_url") or url)
-
-    dl_proc = await asyncio.create_subprocess_exec(
-        "yt-dlp",
-        "-f",
-        "bestaudio/best",
-        "--no-playlist",
-        "-o",
-        output_template,
-        webpage_url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, dl_stderr = await dl_proc.communicate()
-    if dl_proc.returncode != 0:
-        err = dl_stderr.decode("utf-8", errors="ignore").strip() or "Audio download failed"
-        raise RuntimeError(err)
-
-    files = [
-        os.path.join(MUSIC_DIR, name)
-        for name in os.listdir(MUSIC_DIR)
-        if name.startswith(f"{unique_id}.")
-    ]
-    if not files:
-        raise RuntimeError("Downloaded file not found.")
 
     return QueueTrack(
         title=title,
         source_url=webpage_url,
         duration_seconds=duration_seconds,
-        file_path=files[0],
         requested_by=0,
     )
+
+
+async def resolve_stream_url(webpage_url: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        "yt-dlp",
+        "-f",
+        "bestaudio/best",
+        "-g",
+        "--no-playlist",
+        webpage_url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        err = stderr.decode("utf-8", errors="ignore").strip() or "Unable to resolve stream URL"
+        raise RuntimeError(err)
+
+    stream_url = stdout.decode("utf-8", errors="ignore").strip().splitlines()
+    if not stream_url:
+        raise RuntimeError("yt-dlp returned an empty stream URL.")
+    return stream_url[0].strip()
 
 
 def is_youtube_url(value: str) -> bool:
@@ -394,16 +412,22 @@ async def play_next_track(guild: discord.Guild):
         state.current_track = next_track
         state.track_started_at = datetime.now(timezone.utc)
 
-    ffmpeg_source = discord.FFmpegPCMAudio(next_track.file_path)
+    try:
+        stream_url = await resolve_stream_url(next_track.source_url)
+    except RuntimeError as exc:
+        print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
+        await play_next_track(guild)
+        return
+
+    ffmpeg_source = discord.FFmpegPCMAudio(
+        stream_url,
+        before_options="-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        options="-vn -loglevel warning -af aresample=async=1:min_hard_comp=0.100:first_pts=0",
+    )
 
     def _after_playback(play_error: Exception | None):
         if play_error:
             print(f"Playback error: {play_error}")
-        try:
-            if os.path.exists(next_track.file_path):
-                os.remove(next_track.file_path)
-        except OSError:
-            pass
         fut = asyncio.run_coroutine_threadsafe(play_next_track(guild), bot.loop)
         try:
             fut.result()
@@ -1446,7 +1470,7 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
         source = f"ytsearch1:{source}"
 
     try:
-        track = await fetch_track_info_and_audio(source)
+        track = await fetch_track_info(source)
     except RuntimeError as exc:
         await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
         return
@@ -1468,7 +1492,10 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
     await play_next_track(interaction.guild)
 
     await interaction.followup.send(
-        f"Queued **{track.title}** ({format_duration(track.duration_seconds)}). Position in queue: **{queue_position}**.",
+        (
+            f"Queued **{track.title}** ({format_duration(track.duration_seconds)}). "
+            f"Position in queue: **{queue_position}**. [YouTube link]({track.source_url})"
+        ),
         ephemeral=True
     )
 
@@ -1508,7 +1535,11 @@ async def gqueue(interaction: discord.Interaction):
         if started_at is not None:
             elapsed = int((datetime.now(timezone.utc) - started_at).total_seconds())
         lines.append(
-            f"Now playing: **{current_track.title}** [{format_duration(elapsed)} / {format_duration(current_track.duration_seconds)}]"
+            (
+                f"Now playing: **{current_track.title}** "
+                f"[{format_duration(elapsed)} / {format_duration(current_track.duration_seconds)}] "
+                f"([YouTube]({current_track.source_url}))"
+            )
         )
     else:
         lines.append("Now playing: *(nothing)*")
@@ -1516,7 +1547,9 @@ async def gqueue(interaction: discord.Interaction):
     if queued_tracks:
         lines.append("\n**Up next:**")
         for i, track in enumerate(queued_tracks, start=1):
-            lines.append(f"{i}. {track.title} ({format_duration(track.duration_seconds)})")
+            lines.append(
+                f"{i}. {track.title} ({format_duration(track.duration_seconds)}) ([YouTube]({track.source_url}))"
+            )
     else:
         lines.append("\nQueue is empty.")
 
