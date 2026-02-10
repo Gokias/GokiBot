@@ -6,7 +6,6 @@ import random
 import sqlite3
 import asyncio
 import urllib.request
-import shutil
 import json
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -282,39 +281,19 @@ def format_duration(duration_seconds: int) -> str:
     return f"{mins:d}:{secs:02d}"
 
 
-def get_missing_media_dependencies() -> list[str]:
-    missing: list[str] = []
-    if shutil.which("yt-dlp") is None:
-        missing.append("yt-dlp")
-    if shutil.which("ffmpeg") is None:
-        missing.append("ffmpeg")
-    return missing
-
-
-def format_missing_dependency_message(missing: list[str]) -> str:
-    joined = ", ".join(f"`{dep}`" for dep in missing)
-    return (
-        "Music playback is not available because required dependency "
-        f"{joined} is not installed on the bot host."
-    )
-
-
 async def fetch_track_info_and_audio(url: str) -> QueueTrack:
     os.makedirs(MUSIC_DIR, exist_ok=True)
     unique_id = uuid.uuid4().hex
     output_template = os.path.join(MUSIC_DIR, f"{unique_id}.%(ext)s")
 
-    try:
-        info_proc = await asyncio.create_subprocess_exec(
-            "yt-dlp",
-            "--dump-single-json",
-            "--no-playlist",
-            url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError("yt-dlp is not installed on this host.") from exc
+    info_proc = await asyncio.create_subprocess_exec(
+        "yt-dlp",
+        "--dump-single-json",
+        "--no-playlist",
+        url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
     info_stdout, info_stderr = await info_proc.communicate()
     if info_proc.returncode != 0:
         err = info_stderr.decode("utf-8", errors="ignore").strip() or "yt-dlp failed"
@@ -329,20 +308,17 @@ async def fetch_track_info_and_audio(url: str) -> QueueTrack:
     duration_seconds = int(info.get("duration") or 0)
     webpage_url = str(info.get("webpage_url") or url)
 
-    try:
-        dl_proc = await asyncio.create_subprocess_exec(
-            "yt-dlp",
-            "-f",
-            "bestaudio/best",
-            "--no-playlist",
-            "-o",
-            output_template,
-            webpage_url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError("yt-dlp is not installed on this host.") from exc
+    dl_proc = await asyncio.create_subprocess_exec(
+        "yt-dlp",
+        "-f",
+        "bestaudio/best",
+        "--no-playlist",
+        "-o",
+        output_template,
+        webpage_url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
     _, dl_stderr = await dl_proc.communicate()
     if dl_proc.returncode != 0:
         err = dl_stderr.decode("utf-8", errors="ignore").strip() or "Audio download failed"
@@ -396,20 +372,7 @@ async def play_next_track(guild: discord.Guild):
         state.current_track = next_track
         state.track_started_at = datetime.now(timezone.utc)
 
-    try:
-        ffmpeg_source = discord.FFmpegPCMAudio(next_track.file_path)
-    except FileNotFoundError:
-        print("Playback error: ffmpeg is not installed on this host")
-        try:
-            if os.path.exists(next_track.file_path):
-                os.remove(next_track.file_path)
-        except OSError:
-            pass
-        async with state.lock:
-            state.current_track = None
-            state.track_started_at = None
-        await voice_client.disconnect(force=True)
-        return
+    ffmpeg_source = discord.FFmpegPCMAudio(next_track.file_path)
 
     def _after_playback(play_error: Exception | None):
         if play_error:
@@ -1444,14 +1407,6 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
-
-    missing_dependencies = get_missing_media_dependencies()
-    if missing_dependencies:
-        await interaction.followup.send(
-            format_missing_dependency_message(missing_dependencies),
-            ephemeral=True,
-        )
-        return
 
     if interaction.guild.voice_client and interaction.guild.voice_client.channel != voice_channel:
         await interaction.followup.send(
