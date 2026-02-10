@@ -318,6 +318,16 @@ def log_music_timing(step: str, phase: str, started_at: float, **fields: object)
     print(f"[music] {step} {phase} elapsed={elapsed:.2f}s{suffix}")
 
 
+def pick_track_info(info: dict[str, object]) -> dict[str, object]:
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                return entry
+        raise RuntimeError("No playable track found for that query.")
+    return info
+
+
 def extract_stream_url(info: dict[str, object]) -> str:
     direct_url = str(info.get("url") or "").strip()
     if direct_url:
@@ -397,9 +407,12 @@ async def fetch_track_info(url: str) -> QueueTrack:
     title = str(track_info.get("title") or "Unknown title")
     duration_seconds = parse_duration_seconds(track_info.get("duration"))
     if duration_seconds <= 0:
+        duration_seconds = parse_duration_seconds(track_info.get("duration_string"))
+    if duration_seconds <= 0:
         duration_seconds = parse_duration_seconds(info.get("duration_string"))
-    webpage_url = str(info.get("webpage_url") or url)
-    stream_url = extract_stream_url(info)
+
+    webpage_url = str(track_info.get("webpage_url") or info.get("webpage_url") or url)
+    stream_url = extract_stream_url(track_info)
 
     return QueueTrack(
         title=title,
