@@ -75,12 +75,8 @@ WESROTH_CAPTIONS = [
 ]
 
 FETCH_TRACK_INFO_TIMEOUT_SECONDS = 25
-RESOLVE_STREAM_URL_TIMEOUT_SECONDS = 25
 FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
     "Timed out while fetching track info from YouTube. Please try again in a moment."
-)
-RESOLVE_STREAM_URL_TIMEOUT_MESSAGE = (
-    "Timed out while preparing audio stream from YouTube. Skipping this track."
 )
 
 # =========================
@@ -322,10 +318,73 @@ def log_music_timing(step: str, phase: str, started_at: float, **fields: object)
     print(f"[music] {step} {phase} elapsed={elapsed:.2f}s{suffix}")
 
 
-async def fetch_track_info(url: str) -> QueueTrack:
+def pick_track_info(info: dict[str, object]) -> dict[str, object]:
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                return entry
+        raise RuntimeError("No playable track found for that query.")
+    return info
 
+def extract_stream_url(info: dict[str, object]) -> str:
+    direct_url = str(info.get("url") or "").strip()
+    if direct_url:
+        return direct_url
+
+    requested_formats = info.get("requested_formats")
+    if isinstance(requested_formats, list):
+        for fmt in requested_formats:
+            if not isinstance(fmt, dict):
+                continue
+            format_url = str(fmt.get("url") or "").strip()
+            if not format_url:
+                continue
+            if str(fmt.get("vcodec") or "") == "none":
+                return format_url
+
+    formats = info.get("formats")
+    if not isinstance(formats, list):
+        raise RuntimeError("yt-dlp did not provide an audio stream URL.")
+
+    best_audio_url = ""
+    best_audio_score = -1.0
+    fallback_url = ""
+    for fmt in formats:
+        if not isinstance(fmt, dict):
+            continue
+        format_url = str(fmt.get("url") or "").strip()
+        if not format_url:
+            continue
+        if not fallback_url:
+            fallback_url = format_url
+
+        is_audio_only = str(fmt.get("vcodec") or "") == "none"
+        if not is_audio_only:
+            continue
+
+        bitrate = fmt.get("abr") or fmt.get("tbr") or 0
+        try:
+            score = float(bitrate)
+        except (TypeError, ValueError):
+            score = 0.0
+
+        if score >= best_audio_score:
+            best_audio_score = score
+            best_audio_url = format_url
+
+    if best_audio_url:
+        return best_audio_url
+    if fallback_url:
+        return fallback_url
+    raise RuntimeError("yt-dlp returned an empty stream URL.")
+
+
+async def fetch_track_info(url: str) -> QueueTrack:
     info_proc = await asyncio.create_subprocess_exec(
         "yt-dlp",
+        "-f",
+        "bestaudio/best",
         "--dump-single-json",
         "--no-playlist",
         url,
@@ -342,40 +401,22 @@ async def fetch_track_info(url: str) -> QueueTrack:
     except Exception as exc:
         raise RuntimeError("Unable to read track metadata.") from exc
 
-    title = str(info.get("title") or "Unknown title")
-    duration_seconds = parse_duration_seconds(info.get("duration"))
+    track_info = pick_track_info(info)
+
+    title = str(track_info.get("title") or "Unknown title")
+    duration_seconds = parse_duration_seconds(track_info.get("duration"))
     if duration_seconds <= 0:
-        duration_seconds = parse_duration_seconds(info.get("duration_string"))
-    webpage_url = str(info.get("webpage_url") or url)
+        duration_seconds = parse_duration_seconds(track_info.get("duration_string"))
+    webpage_url = str(track_info.get("webpage_url") or url)
+    stream_url = extract_stream_url(track_info)
 
     return QueueTrack(
         title=title,
         source_url=webpage_url,
+        stream_url=stream_url,
         duration_seconds=duration_seconds,
         requested_by=0,
     )
-
-
-async def resolve_stream_url(webpage_url: str) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "yt-dlp",
-        "-f",
-        "bestaudio/best",
-        "-g",
-        "--no-playlist",
-        webpage_url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        err = stderr.decode("utf-8", errors="ignore").strip() or "Unable to resolve stream URL"
-        raise RuntimeError(err)
-
-    stream_url = stdout.decode("utf-8", errors="ignore").strip().splitlines()
-    if not stream_url:
-        raise RuntimeError("yt-dlp returned an empty stream URL.")
-    return stream_url[0].strip()
 
 
 def is_youtube_url(value: str) -> bool:
@@ -432,12 +473,9 @@ async def play_next_track(guild: discord.Guild):
 
     stream_url = next_track.stream_url
     if stream_url is None:
-        try:
-            stream_url = await resolve_stream_url(next_track.source_url)
-        except RuntimeError as exc:
-            print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
-            await play_next_track(guild)
-            return
+        print(f"Failed to resolve stream URL for '{next_track.title}': missing stream URL")
+        await play_next_track(guild)
+        return
 
     ffmpeg_source = discord.FFmpegPCMAudio(
         stream_url,
@@ -1511,11 +1549,6 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
     except RuntimeError as exc:
         await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
         return
-
-    try:
-        track.stream_url = await resolve_stream_url(track.source_url)
-    except RuntimeError as exc:
-        print(f"Failed to pre-resolve stream URL for '{track.title}': {exc}")
 
     track.requested_by = interaction.user.id
 
