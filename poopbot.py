@@ -1469,6 +1469,13 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
     if not is_youtube_url(source):
         source = f"ytsearch1:{source}"
 
+    if interaction.guild.voice_client is None:
+        try:
+            await voice_channel.connect()
+        except discord.DiscordException as exc:
+            await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
+            return
+
     try:
         track = await fetch_track_info(source)
     except RuntimeError as exc:
@@ -1481,13 +1488,6 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
     async with state.lock:
         state.queue.append(track)
         queue_position = len(state.queue)
-
-    if interaction.guild.voice_client is None:
-        try:
-            await voice_channel.connect()
-        except discord.DiscordException as exc:
-            await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
-            return
 
     await play_next_track(interaction.guild)
 
