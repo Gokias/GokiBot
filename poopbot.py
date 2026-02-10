@@ -251,6 +251,7 @@ class QueueTrack:
     source_url: str
     duration_seconds: int
     requested_by: int
+    stream_url: str | None = None
 
 
 class GuildMusicState:
@@ -412,12 +413,14 @@ async def play_next_track(guild: discord.Guild):
         state.current_track = next_track
         state.track_started_at = datetime.now(timezone.utc)
 
-    try:
-        stream_url = await resolve_stream_url(next_track.source_url)
-    except RuntimeError as exc:
-        print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
-        await play_next_track(guild)
-        return
+    stream_url = next_track.stream_url
+    if stream_url is None:
+        try:
+            stream_url = await resolve_stream_url(next_track.source_url)
+        except RuntimeError as exc:
+            print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
+            await play_next_track(guild)
+            return
 
     ffmpeg_source = discord.FFmpegPCMAudio(
         stream_url,
@@ -1474,6 +1477,11 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
     except RuntimeError as exc:
         await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
         return
+
+    try:
+        track.stream_url = await resolve_stream_url(track.source_url)
+    except RuntimeError as exc:
+        print(f"Failed to pre-resolve stream URL for '{track.title}': {exc}")
 
     track.requested_by = interaction.user.id
 
