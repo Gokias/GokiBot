@@ -76,6 +76,12 @@ WESROTH_CAPTIONS = [
 
 FETCH_TRACK_INFO_TIMEOUT_SECONDS = 25
 RESOLVE_STREAM_URL_TIMEOUT_SECONDS = 25
+FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
+    "Timed out while fetching track info from YouTube. Please try again in a moment."
+)
+RESOLVE_STREAM_URL_TIMEOUT_MESSAGE = (
+    "Timed out while preparing audio stream from YouTube. Skipping this track."
+)
 
 # =========================
 # MESSAGES
@@ -308,6 +314,13 @@ def parse_duration_seconds(value: object) -> int:
     return total
 
 
+def log_music_timing(step: str, phase: str, started_at: float, **fields: object):
+    elapsed = time.perf_counter() - started_at
+    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    suffix = f" {details}" if details else ""
+    print(f"[music] {step} {phase} elapsed={elapsed:.2f}s{suffix}")
+
+
 async def fetch_track_info(url: str) -> QueueTrack:
 
     info_proc = await asyncio.create_subprocess_exec(
@@ -417,22 +430,20 @@ async def play_next_track(guild: discord.Guild):
         state.track_started_at = datetime.now(timezone.utc)
 
     resolve_started_at = time.perf_counter()
-    print(f"[music] resolve_stream_url start track='{next_track.title}' url='{next_track.source_url}'")
+    print(f"[music] resolve_stream_url start track={next_track.title!r} url={next_track.source_url!r}")
     try:
         stream_url = await asyncio.wait_for(
             resolve_stream_url(next_track.source_url),
             timeout=RESOLVE_STREAM_URL_TIMEOUT_SECONDS,
         )
-        resolve_elapsed = time.perf_counter() - resolve_started_at
-        print(f"[music] resolve_stream_url end track='{next_track.title}' elapsed={resolve_elapsed:.2f}s")
+        log_music_timing("resolve_stream_url", "end", resolve_started_at, track=next_track.title)
     except asyncio.TimeoutError:
-        resolve_elapsed = time.perf_counter() - resolve_started_at
-        print(
-            f"Timed out after {resolve_elapsed:.2f}s while resolving stream URL for '{next_track.title}'."
-        )
+        log_music_timing("resolve_stream_url", "timeout", resolve_started_at, track=next_track.title)
+        print(f"{RESOLVE_STREAM_URL_TIMEOUT_MESSAGE} track={next_track.title!r}")
         await play_next_track(guild)
         return
     except RuntimeError as exc:
+        log_music_timing("resolve_stream_url", "error", resolve_started_at, track=next_track.title)
         print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
         await play_next_track(guild)
         return
@@ -1489,24 +1500,16 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
         source = f"ytsearch1:{source}"
 
     fetch_started_at = time.perf_counter()
-    print(f"[music] fetch_track_info start source='{source}'")
+    print(f"[music] fetch_track_info start source={source!r}")
     try:
         track = await asyncio.wait_for(
             fetch_track_info(source),
             timeout=FETCH_TRACK_INFO_TIMEOUT_SECONDS,
         )
-        fetch_elapsed = time.perf_counter() - fetch_started_at
-        print(f"[music] fetch_track_info end source='{source}' elapsed={fetch_elapsed:.2f}s")
+        log_music_timing("fetch_track_info", "end", fetch_started_at, source=source)
     except asyncio.TimeoutError:
-        fetch_elapsed = time.perf_counter() - fetch_started_at
-        await interaction.followup.send(
-            (
-                "Timed out while fetching track info from YouTube. "
-                "Please try again in a moment."
-            ),
-            ephemeral=True,
-        )
-        print(f"Timed out after {fetch_elapsed:.2f}s while fetching track info for source='{source}'")
+        log_music_timing("fetch_track_info", "timeout", fetch_started_at, source=source)
+        await interaction.followup.send(FETCH_TRACK_INFO_TIMEOUT_MESSAGE, ephemeral=True)
         return
     except RuntimeError as exc:
         await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
@@ -1522,10 +1525,9 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
     if interaction.guild.voice_client is None:
         try:
             connect_started_at = time.perf_counter()
-            print(f"[music] voice_channel.connect start channel='{voice_channel}'")
+            print(f"[music] voice_channel.connect start channel={voice_channel.name!r}")
             await voice_channel.connect()
-            connect_elapsed = time.perf_counter() - connect_started_at
-            print(f"[music] voice_channel.connect end channel='{voice_channel}' elapsed={connect_elapsed:.2f}s")
+            log_music_timing("voice_channel.connect", "end", connect_started_at, channel=voice_channel.name)
         except discord.DiscordException as exc:
             await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
             return
