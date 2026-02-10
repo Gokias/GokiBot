@@ -6,6 +6,7 @@ import random
 import sqlite3
 import asyncio
 import urllib.request
+from urllib.parse import urlparse
 import json
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -339,6 +340,27 @@ async def fetch_track_info_and_audio(url: str) -> QueueTrack:
         file_path=files[0],
         requested_by=0,
     )
+
+
+def is_youtube_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    hostname = (parsed.hostname or "").lower()
+    youtube_hosts = {
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtu.be",
+        "www.youtu.be",
+    }
+    return hostname in youtube_hosts
 
 
 async def ensure_voice_channel(interaction: discord.Interaction) -> discord.VoiceChannel | None:
@@ -1391,8 +1413,8 @@ def is_dev_user(user_id: int) -> bool:
 
 
 @app_commands.guild_only()
-@bot.tree.command(name="gplay", description="Queue and play audio from a YouTube link.")
-@app_commands.describe(youtube_link="A YouTube video URL.")
+@bot.tree.command(name="gplay", description="Queue and play audio from a YouTube link or search term.")
+@app_commands.describe(youtube_link="A YouTube URL or search text.")
 async def gplay(interaction: discord.Interaction, youtube_link: str):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -1415,8 +1437,16 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
         )
         return
 
+    source = youtube_link.strip()
+    if not source:
+        await interaction.followup.send("Please provide a YouTube link or search query.", ephemeral=True)
+        return
+
+    if not is_youtube_url(source):
+        source = f"ytsearch1:{source}"
+
     try:
-        track = await fetch_track_info_and_audio(youtube_link)
+        track = await fetch_track_info_and_audio(source)
     except RuntimeError as exc:
         await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
         return
@@ -1534,7 +1564,7 @@ async def gokibothelp(interaction: discord.Interaction):
         "- `/poopstats` — Show your poop stats for the year.",
         "- `/featurerequest` — Start a feature request ticket.",
         "- `/collab` — Add someone to the current ticket thread.",
-        "- `/gplay <youtube_link>` — Queue and play YouTube audio.",
+        "- `/gplay <youtube_link_or_search>` — Queue and play YouTube audio.",
         "- `/gqueue` — Show the current playback queue.",
         "- `/gskip` — Skip the currently playing track.",
         "- `/gokibothelp` — Show this help message."
