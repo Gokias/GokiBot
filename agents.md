@@ -2,4 +2,5 @@ If adding a new command, make sure to add it to the /gokibothelp command. Check 
 
 If I need too add an entry to the .env file let me know on the output of the prompt.
 If I require additional configuration to my raspberry pi such as .env changes or system binarys or venv changes, please let me know.
+If there is ever a more standard or better way to do what I am requesting, do that instead and explain why. As long as the outcome is the same I don't care.
 
