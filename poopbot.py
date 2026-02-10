@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, date, time as dtime
+import time
 
 import discord
 from discord import app_commands
@@ -72,6 +73,9 @@ WESROTH_CAPTIONS = [
     "UH OH.",
     "THIS IS IT.",
 ]
+
+FETCH_TRACK_INFO_TIMEOUT_SECONDS = 25
+RESOLVE_STREAM_URL_TIMEOUT_SECONDS = 25
 
 # =========================
 # MESSAGES
@@ -412,8 +416,22 @@ async def play_next_track(guild: discord.Guild):
         state.current_track = next_track
         state.track_started_at = datetime.now(timezone.utc)
 
+    resolve_started_at = time.perf_counter()
+    print(f"[music] resolve_stream_url start track='{next_track.title}' url='{next_track.source_url}'")
     try:
-        stream_url = await resolve_stream_url(next_track.source_url)
+        stream_url = await asyncio.wait_for(
+            resolve_stream_url(next_track.source_url),
+            timeout=RESOLVE_STREAM_URL_TIMEOUT_SECONDS,
+        )
+        resolve_elapsed = time.perf_counter() - resolve_started_at
+        print(f"[music] resolve_stream_url end track='{next_track.title}' elapsed={resolve_elapsed:.2f}s")
+    except asyncio.TimeoutError:
+        resolve_elapsed = time.perf_counter() - resolve_started_at
+        print(
+            f"Timed out after {resolve_elapsed:.2f}s while resolving stream URL for '{next_track.title}'."
+        )
+        await play_next_track(guild)
+        return
     except RuntimeError as exc:
         print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
         await play_next_track(guild)
@@ -434,6 +452,7 @@ async def play_next_track(guild: discord.Guild):
         except Exception as exc:
             print(f"Failed to start next track: {exc}")
 
+    print(f"[music] voice_client.play start track='{next_track.title}'")
     voice_client.play(ffmpeg_source, after=_after_playback)
 
 
@@ -1469,8 +1488,26 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
     if not is_youtube_url(source):
         source = f"ytsearch1:{source}"
 
+    fetch_started_at = time.perf_counter()
+    print(f"[music] fetch_track_info start source='{source}'")
     try:
-        track = await fetch_track_info(source)
+        track = await asyncio.wait_for(
+            fetch_track_info(source),
+            timeout=FETCH_TRACK_INFO_TIMEOUT_SECONDS,
+        )
+        fetch_elapsed = time.perf_counter() - fetch_started_at
+        print(f"[music] fetch_track_info end source='{source}' elapsed={fetch_elapsed:.2f}s")
+    except asyncio.TimeoutError:
+        fetch_elapsed = time.perf_counter() - fetch_started_at
+        await interaction.followup.send(
+            (
+                "Timed out while fetching track info from YouTube. "
+                "Please try again in a moment."
+            ),
+            ephemeral=True,
+        )
+        print(f"Timed out after {fetch_elapsed:.2f}s while fetching track info for source='{source}'")
+        return
     except RuntimeError as exc:
         await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
         return
@@ -1484,7 +1521,11 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
 
     if interaction.guild.voice_client is None:
         try:
+            connect_started_at = time.perf_counter()
+            print(f"[music] voice_channel.connect start channel='{voice_channel}'")
             await voice_channel.connect()
+            connect_elapsed = time.perf_counter() - connect_started_at
+            print(f"[music] voice_channel.connect end channel='{voice_channel}' elapsed={connect_elapsed:.2f}s")
         except discord.DiscordException as exc:
             await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
             return
