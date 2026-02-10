@@ -455,6 +455,13 @@ async def ensure_voice_channel(interaction: discord.Interaction) -> discord.Voic
     return member.voice.channel
 
 
+def format_music_audience_prefix(voice_channel: discord.VoiceChannel) -> str:
+    listeners = [member.mention for member in voice_channel.members if not member.bot]
+    if not listeners:
+        return f"{voice_channel.mention}\n"
+    return f"{' '.join(listeners)}\n"
+
+
 async def play_next_track(guild: discord.Guild):
     voice_client = guild.voice_client
     if voice_client is None:
@@ -1504,29 +1511,29 @@ def is_dev_user(user_id: int) -> bool:
 @app_commands.describe(youtube_link="A YouTube URL or search text.")
 async def gplay(interaction: discord.Interaction, youtube_link: str):
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await interaction.response.send_message("This command only works in a server.")
         return
 
     voice_channel = await ensure_voice_channel(interaction)
     if voice_channel is None:
         await interaction.response.send_message(
-            "You must be in a voice channel to use this command.",
-            ephemeral=True
+            "You must be in a voice channel to use this command."
         )
         return
 
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    audience_prefix = format_music_audience_prefix(voice_channel)
+
+    await interaction.response.defer(thinking=True)
 
     if interaction.guild.voice_client and interaction.guild.voice_client.channel != voice_channel:
         await interaction.followup.send(
-            f"You must be in {interaction.guild.voice_client.channel.mention} to control playback.",
-            ephemeral=True
+            f"{audience_prefix}You must be in {interaction.guild.voice_client.channel.mention} to control playback."
         )
         return
 
     source = youtube_link.strip()
     if not source:
-        await interaction.followup.send("Please provide a YouTube link or search query.", ephemeral=True)
+        await interaction.followup.send(f"{audience_prefix}Please provide a YouTube link or search query.")
         return
 
     if not is_youtube_url(source):
@@ -1536,7 +1543,7 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
         try:
             await voice_channel.connect()
         except discord.DiscordException as exc:
-            await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
+            await interaction.followup.send(f"{audience_prefix}Could not join voice channel: {exc}")
             return
 
     fetch_started_at = time.perf_counter()
@@ -1548,10 +1555,10 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
         log_music_timing("fetch_track_info", "end", fetch_started_at, source=source)
     except asyncio.TimeoutError:
         log_music_timing("fetch_track_info", "timeout", fetch_started_at, source=source)
-        await interaction.followup.send(FETCH_TRACK_INFO_TIMEOUT_MESSAGE, ephemeral=True)
+        await interaction.followup.send(f"{audience_prefix}{FETCH_TRACK_INFO_TIMEOUT_MESSAGE}")
         return
     except RuntimeError as exc:
-        await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
+        await interaction.followup.send(f"{audience_prefix}Could not fetch audio: {exc}")
         return
 
     track.requested_by = interaction.user.id
@@ -1565,10 +1572,9 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
 
     await interaction.followup.send(
         (
-            f"Queued **{track.title}** ({format_duration(track.duration_seconds)}). "
+            f"{audience_prefix}Queued **{track.title}** ({format_duration(track.duration_seconds)}). "
             f"Position in queue: **{queue_position}**. [YouTube link]({track.source_url})"
-        ),
-        ephemeral=True
+        )
     )
 
 
@@ -1576,22 +1582,22 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
 @bot.tree.command(name="gqueue", description="Show the current playback queue.")
 async def gqueue(interaction: discord.Interaction):
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await interaction.response.send_message("This command only works in a server.")
         return
 
     voice_channel = await ensure_voice_channel(interaction)
     if voice_channel is None:
         await interaction.response.send_message(
-            "You must be in a voice channel to use this command.",
-            ephemeral=True
+            "You must be in a voice channel to use this command."
         )
         return
+
+    audience_prefix = format_music_audience_prefix(voice_channel)
 
     vc = interaction.guild.voice_client
     if vc is not None and vc.channel != voice_channel:
         await interaction.response.send_message(
-            f"You must be in {vc.channel.mention} to view this queue.",
-            ephemeral=True
+            f"{audience_prefix}You must be in {vc.channel.mention} to view this queue."
         )
         return
 
@@ -1625,42 +1631,43 @@ async def gqueue(interaction: discord.Interaction):
     else:
         lines.append("\nQueue is empty.")
 
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    queue_message = "\n".join(lines)
+    await interaction.response.send_message(f"{audience_prefix}{queue_message}")
 
 
 @app_commands.guild_only()
 @bot.tree.command(name="gskip", description="Skip the currently playing track.")
 async def gskip(interaction: discord.Interaction):
     if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        await interaction.response.send_message("This command only works in a server.")
         return
 
     voice_channel = await ensure_voice_channel(interaction)
     if voice_channel is None:
         await interaction.response.send_message(
-            "You must be in a voice channel to use this command.",
-            ephemeral=True
+            "You must be in a voice channel to use this command."
         )
         return
 
+    audience_prefix = format_music_audience_prefix(voice_channel)
+
     vc = interaction.guild.voice_client
     if vc is None or not vc.is_connected():
-        await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+        await interaction.response.send_message(f"{audience_prefix}Nothing is playing right now.")
         return
 
     if vc.channel != voice_channel:
         await interaction.response.send_message(
-            f"You must be in {vc.channel.mention} to skip tracks.",
-            ephemeral=True
+            f"{audience_prefix}You must be in {vc.channel.mention} to skip tracks."
         )
         return
 
     if not vc.is_playing() and not vc.is_paused():
-        await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+        await interaction.response.send_message(f"{audience_prefix}Nothing is currently playing.")
         return
 
     vc.stop()
-    await interaction.response.send_message("⏭️ Skipped current track.", ephemeral=True)
+    await interaction.response.send_message(f"{audience_prefix}⏭️ Skipped current track.")
 
 @bot.tree.command(name="gokibothelp", description="Show all available GokiBot commands.")
 async def gokibothelp(interaction: discord.Interaction):
