@@ -261,6 +261,7 @@ class QueueTrack:
     source_url: str
     duration_seconds: int
     requested_by: int
+    stream_url: str | None = None
 
 
 class GuildMusicState:
@@ -429,24 +430,14 @@ async def play_next_track(guild: discord.Guild):
         state.current_track = next_track
         state.track_started_at = datetime.now(timezone.utc)
 
-    resolve_started_at = time.perf_counter()
-    print(f"[music] resolve_stream_url start track={next_track.title!r} url={next_track.source_url!r}")
-    try:
-        stream_url = await asyncio.wait_for(
-            resolve_stream_url(next_track.source_url),
-            timeout=RESOLVE_STREAM_URL_TIMEOUT_SECONDS,
-        )
-        log_music_timing("resolve_stream_url", "end", resolve_started_at, track=next_track.title)
-    except asyncio.TimeoutError:
-        log_music_timing("resolve_stream_url", "timeout", resolve_started_at, track=next_track.title)
-        print(f"{RESOLVE_STREAM_URL_TIMEOUT_MESSAGE} track={next_track.title!r}")
-        await play_next_track(guild)
-        return
-    except RuntimeError as exc:
-        log_music_timing("resolve_stream_url", "error", resolve_started_at, track=next_track.title)
-        print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
-        await play_next_track(guild)
-        return
+    stream_url = next_track.stream_url
+    if stream_url is None:
+        try:
+            stream_url = await resolve_stream_url(next_track.source_url)
+        except RuntimeError as exc:
+            print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
+            await play_next_track(guild)
+            return
 
     ffmpeg_source = discord.FFmpegPCMAudio(
         stream_url,
@@ -1499,8 +1490,13 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
     if not is_youtube_url(source):
         source = f"ytsearch1:{source}"
 
-    fetch_started_at = time.perf_counter()
-    print(f"[music] fetch_track_info start source={source!r}")
+    if interaction.guild.voice_client is None:
+        try:
+            await voice_channel.connect()
+        except discord.DiscordException as exc:
+            await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
+            return
+
     try:
         track = await asyncio.wait_for(
             fetch_track_info(source),
@@ -1515,22 +1511,17 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
         await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
         return
 
+    try:
+        track.stream_url = await resolve_stream_url(track.source_url)
+    except RuntimeError as exc:
+        print(f"Failed to pre-resolve stream URL for '{track.title}': {exc}")
+
     track.requested_by = interaction.user.id
 
     state = get_music_state(interaction.guild.id)
     async with state.lock:
         state.queue.append(track)
         queue_position = len(state.queue)
-
-    if interaction.guild.voice_client is None:
-        try:
-            connect_started_at = time.perf_counter()
-            print(f"[music] voice_channel.connect start channel={voice_channel.name!r}")
-            await voice_channel.connect()
-            log_music_timing("voice_channel.connect", "end", connect_started_at, channel=voice_channel.name)
-        except discord.DiscordException as exc:
-            await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
-            return
 
     await play_next_track(interaction.guild)
 
