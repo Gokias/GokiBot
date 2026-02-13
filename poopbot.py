@@ -257,7 +257,6 @@ class QueueTrack:
     source_url: str
     duration_seconds: int
     requested_by: int
-    stream_url: str | None = None
 
 
 class GuildMusicState:
@@ -381,14 +380,67 @@ def extract_stream_url(info: dict[str, object]) -> str:
     raise RuntimeError("yt-dlp returned an empty stream URL.")
 
 
-async def fetch_track_info(url: str) -> QueueTrack:
+def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTrack]:
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        tracks: list[QueueTrack] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+
+            title = str(entry.get("title") or "Unknown title")
+            duration_seconds = parse_duration_seconds(entry.get("duration"))
+            if duration_seconds <= 0:
+                duration_seconds = parse_duration_seconds(entry.get("duration_string"))
+
+            webpage_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+            if not webpage_url:
+                entry_id = str(entry.get("id") or "").strip()
+                if entry_id:
+                    webpage_url = f"https://www.youtube.com/watch?v={entry_id}"
+                else:
+                    webpage_url = source
+
+            tracks.append(
+                QueueTrack(
+                    title=title,
+                    source_url=webpage_url,
+                    duration_seconds=duration_seconds,
+                    requested_by=0,
+                )
+            )
+
+        if tracks:
+            return tracks
+        raise RuntimeError("No playable tracks found for that playlist.")
+
+    track_info = pick_track_info(info)
+    title = str(track_info.get("title") or "Unknown title")
+    duration_seconds = parse_duration_seconds(track_info.get("duration"))
+    if duration_seconds <= 0:
+        duration_seconds = parse_duration_seconds(track_info.get("duration_string"))
+    if duration_seconds <= 0:
+        duration_seconds = parse_duration_seconds(info.get("duration_string"))
+
+    webpage_url = str(track_info.get("webpage_url") or info.get("webpage_url") or source)
+
+    return [
+        QueueTrack(
+            title=title,
+            source_url=webpage_url,
+            duration_seconds=duration_seconds,
+            requested_by=0,
+        )
+    ]
+
+
+async def fetch_tracks(source: str) -> list[QueueTrack]:
     info_proc = await asyncio.create_subprocess_exec(
         "yt-dlp",
         "-f",
         "bestaudio/best",
         "--dump-single-json",
-        "--no-playlist",
-        url,
+        source,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -402,25 +454,31 @@ async def fetch_track_info(url: str) -> QueueTrack:
     except Exception as exc:
         raise RuntimeError("Unable to read track metadata.") from exc
 
-    track_info = pick_track_info(info)
+    return parse_tracks_from_info(info, source)
 
-    title = str(track_info.get("title") or "Unknown title")
-    duration_seconds = parse_duration_seconds(track_info.get("duration"))
-    if duration_seconds <= 0:
-        duration_seconds = parse_duration_seconds(track_info.get("duration_string"))
-    if duration_seconds <= 0:
-        duration_seconds = parse_duration_seconds(info.get("duration_string"))
 
-    webpage_url = str(track_info.get("webpage_url") or info.get("webpage_url") or url)
-    stream_url = extract_stream_url(track_info)
-
-    return QueueTrack(
-        title=title,
-        source_url=webpage_url,
-        stream_url=stream_url,
-        duration_seconds=duration_seconds,
-        requested_by=0,
+async def resolve_stream_url(source_url: str) -> str:
+    stream_proc = await asyncio.create_subprocess_exec(
+        "yt-dlp",
+        "-f",
+        "bestaudio/best",
+        "--dump-single-json",
+        "--no-playlist",
+        source_url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    stream_stdout, stream_stderr = await stream_proc.communicate()
+    if stream_proc.returncode != 0:
+        err = stream_stderr.decode("utf-8", errors="ignore").strip() or "yt-dlp failed"
+        raise RuntimeError(err)
+
+    try:
+        info = json.loads(stream_stdout.decode("utf-8", errors="ignore"))
+    except Exception as exc:
+        raise RuntimeError("Unable to read playback stream URL.") from exc
+
+    return extract_stream_url(pick_track_info(info))
 
 
 def is_youtube_url(value: str) -> bool:
@@ -475,15 +533,20 @@ async def play_next_track(guild: discord.Guild):
         state.current_track = next_track
         state.track_started_at = datetime.now(timezone.utc)
 
-    stream_url = next_track.stream_url
-    if stream_url is None:
-        print(f"Failed to resolve stream URL for '{next_track.title}': missing stream URL")
+    try:
+        stream_url = await resolve_stream_url(next_track.source_url)
+    except RuntimeError as exc:
+        print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
         await play_next_track(guild)
         return
 
     ffmpeg_source = discord.FFmpegPCMAudio(
         stream_url,
-        before_options="-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        before_options=(
+            "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+            "-user_agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36'"
+        ),
         options="-vn -loglevel warning -af aresample=async=1:min_hard_comp=0.100:first_pts=0",
     )
 
@@ -1541,8 +1604,8 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
 
     fetch_started_at = time.perf_counter()
     try:
-        track = await asyncio.wait_for(
-            fetch_track_info(source),
+        tracks = await asyncio.wait_for(
+            fetch_tracks(source),
             timeout=FETCH_TRACK_INFO_TIMEOUT_SECONDS,
         )
         log_music_timing("fetch_track_info", "end", fetch_started_at, source=source)
@@ -1554,19 +1617,36 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
         await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
         return
 
-    track.requested_by = interaction.user.id
+    for track in tracks:
+        track.requested_by = interaction.user.id
 
     state = get_music_state(interaction.guild.id)
     async with state.lock:
-        state.queue.append(track)
-        queue_position = len(state.queue)
+        starting_queue_size = len(state.queue)
+        state.queue.extend(tracks)
+        first_queue_position = starting_queue_size + 1
 
     await play_next_track(interaction.guild)
 
+    if len(tracks) == 1:
+        track = tracks[0]
+        await interaction.followup.send(
+            (
+                f"Queued **{track.title}** ({format_duration(track.duration_seconds)}). "
+                f"Position in queue: **{first_queue_position}**. [YouTube link]({track.source_url})"
+            ),
+            ephemeral=True
+        )
+        return
+
+    total_seconds = sum(track.duration_seconds for track in tracks)
+    first_track = tracks[0]
     await interaction.followup.send(
         (
-            f"Queued **{track.title}** ({format_duration(track.duration_seconds)}). "
-            f"Position in queue: **{queue_position}**. [YouTube link]({track.source_url})"
+            f"Queued **{len(tracks)}** tracks from playlist/search results "
+            f"(total {format_duration(total_seconds)}). "
+            f"First position: **{first_queue_position}**. "
+            f"Starts with: **{first_track.title}** ([YouTube link]({first_track.source_url}))."
         ),
         ephemeral=True
     )
