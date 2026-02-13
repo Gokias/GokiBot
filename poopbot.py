@@ -347,9 +347,16 @@ def extract_stream_url(info: dict[str, object]) -> str:
     if not isinstance(formats, list):
         raise RuntimeError("yt-dlp did not provide an audio stream URL.")
 
+    def _is_hls_protocol(fmt: dict[str, object]) -> bool:
+        protocol = str(fmt.get("protocol") or "").lower()
+        return "m3u8" in protocol or protocol == "http_dash_segments"
+
     best_audio_url = ""
     best_audio_score = -1.0
+    best_hls_audio_url = ""
+    best_hls_audio_score = -1.0
     fallback_url = ""
+    fallback_non_hls_url = ""
     for fmt in formats:
         if not isinstance(fmt, dict):
             continue
@@ -358,6 +365,10 @@ def extract_stream_url(info: dict[str, object]) -> str:
             continue
         if not fallback_url:
             fallback_url = format_url
+
+        is_hls = _is_hls_protocol(fmt)
+        if not is_hls and not fallback_non_hls_url:
+            fallback_non_hls_url = format_url
 
         is_audio_only = str(fmt.get("vcodec") or "") == "none"
         if not is_audio_only:
@@ -369,12 +380,21 @@ def extract_stream_url(info: dict[str, object]) -> str:
         except (TypeError, ValueError):
             score = 0.0
 
-        if score >= best_audio_score:
-            best_audio_score = score
-            best_audio_url = format_url
+        if is_hls:
+            if score >= best_hls_audio_score:
+                best_hls_audio_score = score
+                best_hls_audio_url = format_url
+        else:
+            if score >= best_audio_score:
+                best_audio_score = score
+                best_audio_url = format_url
 
     if best_audio_url:
         return best_audio_url
+    if fallback_non_hls_url:
+        return fallback_non_hls_url
+    if best_hls_audio_url:
+        return best_hls_audio_url
     if fallback_url:
         return fallback_url
     raise RuntimeError("yt-dlp returned an empty stream URL.")
@@ -544,8 +564,10 @@ async def play_next_track(guild: discord.Guild):
         stream_url,
         before_options=(
             "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+            "-http_persistent 0 "
             "-user_agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36'"
+            "Chrome/131.0.0.0 Safari/537.36' "
+            "-headers 'Referer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com\r\n'"
         ),
         options="-vn -loglevel warning -af aresample=async=1:min_hard_comp=0.100:first_pts=0",
     )
