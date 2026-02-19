@@ -588,11 +588,39 @@ async def wait_for_voice_client_ready(vc: discord.VoiceClient, timeout_seconds: 
     while time.monotonic() < deadline:
         if not vc.is_connected():
             return False
+
         ws = getattr(vc, "ws", None)
-        if ws and hasattr(ws, "poll_event"):
+        if ws is not None and hasattr(ws, "poll_event") and callable(getattr(ws, "poll_event")):
             return True
+
+        connected_event = getattr(vc, "_connected", None)
+        if connected_event is not None and hasattr(connected_event, "is_set") and connected_event.is_set():
+            # py-cord may expose the connected event before ws assignment; keep waiting briefly
+            # unless ws is already a valid websocket object with poll_event.
+            await asyncio.sleep(0.1)
+            continue
+
         await asyncio.sleep(0.1)
     return False
+
+
+def describe_voice_client_state(vc: discord.VoiceClient) -> str:
+    connected_event = getattr(vc, "_connected", None)
+    connected_event_set = (
+        connected_event.is_set() if connected_event is not None and hasattr(connected_event, "is_set") else None
+    )
+    ws = getattr(vc, "ws", None)
+    ws_has_poll_event = hasattr(ws, "poll_event") and callable(getattr(ws, "poll_event", None))
+    channel = getattr(vc, "channel", None)
+    return (
+        f"connected={vc.is_connected()} "
+        f"event_set={connected_event_set} "
+        f"ws={type(ws).__name__ if ws is not None else None} "
+        f"ws_ready={ws_has_poll_event} "
+        f"channel_id={getattr(channel, 'id', None)}"
+    )
+
+
 async def play_next_track(guild: discord.Guild):
     voice_client = guild.voice_client
     if voice_client is None:
@@ -1662,6 +1690,7 @@ async def gtranscribe(interaction: discord.Interaction):
         await interaction.followup.send("I couldn't initialize a voice client.", ephemeral=True)
         return
     if not await wait_for_voice_client_ready(vc):
+        print(f"[transcribe] voice client not ready after wait: {describe_voice_client_state(vc)}")
         if connected_here:
             try:
                 await vc.disconnect(force=True)
