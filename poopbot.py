@@ -352,8 +352,8 @@ async def finalize_transcription_session(
     engine_name, engine = get_whisper_transcriber()
     if engine is None or engine_name is None:
         return None, (
-            "No local transcription engine was found. Install `faster-whisper` (recommended) "
-            "or `openai-whisper` on the host."
+            "No local transcription engine was found. Install dependencies with "
+            "`pip install -r requirements.txt` (includes `faster-whisper`)."
         )
     transcript_path = session.temp_dir / f"transcript-{guild.id}-{int(time.time())}.txt"
     lines = [
@@ -1684,7 +1684,7 @@ async def gtranscribe(interaction: discord.Interaction):
         except (discord.ClientException, discord.HTTPException, asyncio.TimeoutError) as exc:
             print(f"[transcribe] voice connect failed: {type(exc).__name__}: {exc}")
             await interaction.followup.send(
-                "I couldn't join your voice channel. Confirm I have **Connect/Speak** permissions and that PyNaCl is installed (`pip install -r requirements.txt`).",
+                "I couldn't join your voice channel. Confirm I have **Connect/Speak** permissions and that dependencies are installed (`pip install -r requirements.txt`).",
                 ephemeral=True,
             )
             return
@@ -1731,7 +1731,7 @@ async def gtranscribe(interaction: discord.Interaction):
             except (discord.HTTPException, discord.ClientException):
                 pass
         await interaction.followup.send(
-            f"I joined voice but couldn't start recording: `{type(exc).__name__}`. Ensure `PyNaCl` is installed in the bot venv and system Opus is available (`libopus0`/`libopus.so`).",
+            f"I joined voice but couldn't start recording: `{type(exc).__name__}`. Ensure dependencies are installed (`pip install -r requirements.txt`) and system Opus is available (`libopus0`/`libopus.so`).",
             ephemeral=True,
         )
         return
