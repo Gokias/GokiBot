@@ -5,6 +5,8 @@ import uuid
 import random
 import sqlite3
 import asyncio
+import logging
+import logging.handlers
 import urllib.request
 from urllib.parse import urlparse
 import json
@@ -20,6 +22,70 @@ from pathlib import Path
 import time
 import discord
 from discord.ext import commands, tasks
+
+load_dotenv()  # loads variables from .env into the process environment
+
+logger = logging.getLogger("gokibot")
+
+
+def configure_logging() -> None:
+    log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
+    stdout_handler = logging.StreamHandler()
+    stdout_handler.setFormatter(formatter)
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_dir / "gokibot.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(log_level)
+    root_logger.addHandler(stdout_handler)
+    root_logger.addHandler(file_handler)
+    logger.info("logging_configured level=%s", logging.getLevelName(log_level))
+
+
+def interaction_log_context(interaction: discord.Interaction) -> dict[str, object]:
+    return {
+        "guild_id": getattr(interaction.guild, "id", None),
+        "channel_id": getattr(interaction.channel, "id", None),
+        "user_id": getattr(interaction.user, "id", None),
+        "interaction": getattr(getattr(interaction, "command", None), "qualified_name", None),
+    }
+
+
+def register_loop_exception_handler(loop: asyncio.AbstractEventLoop) -> None:
+    if getattr(loop, "_gokibot_exception_handler_installed", False):
+        return
+    default_handler = loop.get_exception_handler()
+
+    def _loop_exception_handler(active_loop: asyncio.AbstractEventLoop, context: dict[str, object]) -> None:
+        message = context.get("message", "Unhandled asyncio loop exception")
+        exception = context.get("exception")
+        if exception is not None:
+            logger.exception("loop_exception message=%s context=%r", message, context, exc_info=exception)
+        else:
+            logger.error("loop_exception message=%s context=%r", message, context)
+        if default_handler is not None:
+            default_handler(active_loop, context)
+        else:
+            active_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_loop_exception_handler)
+    setattr(loop, "_gokibot_exception_handler_installed", True)
+    logger.info("loop_exception_handler_registered")
+
+
+configure_logging()
 try:
     from zoneinfo import ZoneInfo
     from zoneinfo import ZoneInfoNotFoundError
@@ -37,12 +103,11 @@ if not discord.opus.is_loaded():
         except Exception as e:
             _OPUS_LOAD_ERROR = str(e)
 if not discord.opus.is_loaded() and _OPUS_LOAD_ERROR:
-    print(f"[voice] Failed to load Opus: {_OPUS_LOAD_ERROR}")
+    logger.warning("voice opus_load_failed error=%s", _OPUS_LOAD_ERROR)
 
 # =========================
 # CONFIG
 # =========================
-load_dotenv()  # loads variables from .env into the process environment
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN not found. Check your .env file and WorkingDirectory.")
@@ -339,6 +404,13 @@ def copy_recorded_audio_to_session(
             continue
         copied_files[user_id] = temp_output
     session.voice_paths_by_user = copied_files
+    logger.info(
+        "transcribe_audio_copied guild_id=%s voice_channel_id=%s temp_dir=%s captured_files=%s",
+        session.guild_id,
+        session.voice_channel_id,
+        session.temp_dir,
+        len(copied_files),
+    )
     return copied_files
 async def finalize_transcription_session(
     interaction: discord.Interaction,
@@ -397,9 +469,7 @@ def parse_duration_seconds(value: object) -> int:
     return total
 def log_music_timing(step: str, phase: str, started_at: float, **fields: object):
     elapsed = time.perf_counter() - started_at
-    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
-    suffix = f" {details}" if details else ""
-    print(f"[music] {step} {phase} elapsed={elapsed:.2f}s{suffix}")
+    logger.info("music_timing step=%s phase=%s elapsed_s=%.2f details=%r", step, phase, elapsed, fields)
 def pick_track_info(info: dict[str, object]) -> dict[str, object]:
     entries = info.get("entries")
     if isinstance(entries, list):
@@ -621,6 +691,25 @@ def describe_voice_client_state(vc: discord.VoiceClient) -> str:
         f"channel_id={getattr(channel, 'id', None)}"
     )
 
+def describe_transcription_session_state(session: GuildTranscriptionSession | None) -> str:
+    if session is None:
+        return "session=none"
+    file_count = len(session.voice_paths_by_user)
+    return f"temp_dir={session.temp_dir} captured_files={file_count}"
+
+
+def build_interaction_log_context(
+    interaction: discord.Interaction,
+    vc: discord.VoiceClient | None = None,
+    session: GuildTranscriptionSession | None = None,
+) -> dict[str, object]:
+    context = interaction_log_context(interaction)
+    context["voice_state"] = describe_voice_client_state(vc) if vc is not None else "voice_client=none"
+    if session is not None:
+        context["transcription_session"] = describe_transcription_session_state(session)
+    return context
+
+
 
 async def play_next_track(guild: discord.Guild):
     voice_client = guild.voice_client
@@ -638,10 +727,17 @@ async def play_next_track(guild: discord.Guild):
         next_track = state.queue.popleft()
         state.current_track = next_track
         state.track_started_at = datetime.now(timezone.utc)
+    music_context = {
+        "guild_id": guild.id,
+        "channel_id": getattr(getattr(voice_client, "channel", None), "id", None),
+        "user_id": next_track.requested_by,
+        "interaction": "music_playback",
+        "voice_state": describe_voice_client_state(voice_client),
+    }
     try:
         stream_url = await resolve_stream_url(next_track.source_url)
-    except RuntimeError as exc:
-        print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
+    except RuntimeError:
+        logger.exception("music_stream_resolve_failed track=%s context=%r", next_track.title, music_context)
         await play_next_track(guild)
         return
     ffmpeg_source = discord.FFmpegPCMAudio(
@@ -657,13 +753,13 @@ async def play_next_track(guild: discord.Guild):
     )
     def _after_playback(play_error: Exception | None):
         if play_error:
-            print(f"Playback error: {play_error}")
+            logger.exception("music_playback_error context=%r", music_context, exc_info=play_error)
         fut = asyncio.run_coroutine_threadsafe(play_next_track(guild), bot.loop)
         try:
             fut.result()
-        except Exception as exc:
-            print(f"Failed to start next track: {exc}")
-    print(f"[music] voice_client.play start track='{next_track.title}'")
+        except Exception:
+            logger.exception("music_next_track_start_failed context=%r", music_context)
+    logger.info("music_play_start track=%s context=%r", next_track.title, music_context)
     voice_client.play(ffmpeg_source, after=_after_playback)
 # =========================
 # DATABASE HELPERS
@@ -929,11 +1025,11 @@ async def resolve_wesroth_channel_id() -> str | None:
     try:
         html = await asyncio.to_thread(_fetch_url_text, WESROTH_HANDLE_URL)
     except OSError as exc:
-        print(f"Failed to fetch WesRoth channel page: {exc}")
+        logger.exception("wesroth_channel_fetch_failed")
         return None
     channel_id = _extract_channel_id_from_handle_page(html)
     if not channel_id:
-        print("Failed to parse WesRoth channel id from handle page.")
+        logger.warning("wesroth_channel_id_parse_failed")
     return channel_id
 def _parse_wesroth_feed(xml_text: str) -> list[dict]:
     root = ET.fromstring(xml_text)
@@ -969,7 +1065,7 @@ async def fetch_wesroth_latest_today() -> dict | None:
     try:
         xml_text = await asyncio.to_thread(_fetch_url_text, feed_url)
     except OSError as exc:
-        print(f"Failed to fetch WesRoth feed: {exc}")
+        logger.exception("wesroth_feed_fetch_failed")
         return None
     entries = _parse_wesroth_feed(xml_text)
     if not entries:
@@ -1045,12 +1141,13 @@ async def log_cleanup_message(message: discord.Message):
                 message.content,
                 created_at.isoformat()
             ))
-    print(
-        "Cleanup message stored:",
-        f"user={message.author} ({message.author.id})",
-        f"channel={message.channel.id}",
-        f"time={created_at.isoformat()}",
-        f"text={message.content!r}"
+    logger.info(
+        "cleanup_message_stored user=%s user_id=%s channel_id=%s created_at=%s text=%r",
+        message.author,
+        message.author.id,
+        message.channel.id,
+        created_at.isoformat(),
+        message.content,
     )
 def find_last_active_poop_event_id(user_id: int, year: int) -> str | None:
     """Most recent POOP in the given year that has NOT been undone by that same user."""
@@ -1494,6 +1591,9 @@ async def gplay(interaction: discord.Interaction, youtube_link: discord.Option(s
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
     voice_channel = await ensure_voice_channel(interaction)
+    vc = interaction.guild.voice_client
+    cmd_context = build_interaction_log_context(interaction, vc=vc)
+    logger.info("music_command_start name=gplay context=%r", cmd_context)
     if voice_channel is None:
         await interaction.response.send_message(
             "You must be in a voice channel to use this command.",
@@ -1517,8 +1617,9 @@ async def gplay(interaction: discord.Interaction, youtube_link: discord.Option(s
     if interaction.guild.voice_client is None:
         try:
             await voice_channel.connect()
-        except discord.DiscordException as exc:
-            await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
+        except discord.DiscordException:
+            logger.exception("music_voice_connect_failed context=%r", build_interaction_log_context(interaction, vc=interaction.guild.voice_client))
+            await interaction.followup.send("Could not join voice channel.", ephemeral=True)
             return
     fetch_started_at = time.perf_counter()
     try:
@@ -1531,8 +1632,9 @@ async def gplay(interaction: discord.Interaction, youtube_link: discord.Option(s
         log_music_timing("fetch_track_info", "timeout", fetch_started_at, source=source)
         await interaction.followup.send(FETCH_TRACK_INFO_TIMEOUT_MESSAGE, ephemeral=True)
         return
-    except RuntimeError as exc:
-        await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
+    except RuntimeError:
+        logger.exception("music_fetch_tracks_failed context=%r source=%r", build_interaction_log_context(interaction, vc=interaction.guild.voice_client), source)
+        await interaction.followup.send("Could not fetch audio.", ephemeral=True)
         return
     for track in tracks:
         track.requested_by = interaction.user.id
@@ -1541,6 +1643,7 @@ async def gplay(interaction: discord.Interaction, youtube_link: discord.Option(s
         starting_queue_size = len(state.queue)
         state.queue.extend(tracks)
         first_queue_position = starting_queue_size + 1
+    logger.info("music_tracks_queued count=%s first_position=%s context=%r", len(tracks), first_queue_position, build_interaction_log_context(interaction, vc=interaction.guild.voice_client))
     await play_next_track(interaction.guild)
     if len(tracks) == 1:
         track = tracks[0]
@@ -1577,6 +1680,7 @@ async def gqueue(interaction: discord.Interaction):
         )
         return
     vc = interaction.guild.voice_client
+    logger.info("music_command_start name=gqueue context=%r", build_interaction_log_context(interaction, vc=vc))
     if vc is not None and vc.channel != voice_channel:
         await interaction.response.send_message(
             f"You must be in {vc.channel.mention} to view this queue.",
@@ -1625,6 +1729,7 @@ async def gskip(interaction: discord.Interaction):
         )
         return
     vc = interaction.guild.voice_client
+    logger.info("music_command_start name=gskip context=%r", build_interaction_log_context(interaction, vc=vc))
     if vc is None or not vc.is_connected():
         await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
         return
@@ -1637,11 +1742,13 @@ async def gskip(interaction: discord.Interaction):
     if not vc.is_playing() and not vc.is_paused():
         await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
         return
+    logger.info("music_command_execute name=gskip context=%r", build_interaction_log_context(interaction, vc=vc))
     vc.stop()
     await interaction.response.send_message("⏭️ Skipped current track.", ephemeral=True)
 @discord.guild_only()
 @bot.slash_command(name="gtranscribe", description="Join your voice channel and start recording speakers for transcription.")
 async def gtranscribe(interaction: discord.Interaction):
+    logger.info("transcribe_command_start context=%r", build_interaction_log_context(interaction, vc=getattr(getattr(interaction, "guild", None), "voice_client", None)))
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
@@ -1680,8 +1787,8 @@ async def gtranscribe(interaction: discord.Interaction):
         try:
             vc = await voice_channel.connect(timeout=15.0, reconnect=True)
             connected_here = True
-        except (discord.ClientException, discord.HTTPException, asyncio.TimeoutError) as exc:
-            print(f"[transcribe] voice connect failed: {type(exc).__name__}: {exc}")
+        except (discord.ClientException, discord.HTTPException, asyncio.TimeoutError):
+            logger.exception("transcribe_voice_connect_failed context=%r", build_interaction_log_context(interaction, vc=interaction.guild.voice_client))
             await interaction.followup.send(
                 "I couldn't join your voice channel. Confirm I have **Connect/Speak** permissions and that dependencies are installed (`pip install -r requirements.txt`).",
                 ephemeral=True,
@@ -1694,17 +1801,16 @@ async def gtranscribe(interaction: discord.Interaction):
     ready = await wait_for_voice_client_ready(vc)
     readiness_elapsed = time.monotonic() - ready_check_started
     ws = getattr(vc, "ws", None)
-    print(
-        "[transcribe] voice readiness "
-        f"guild_id={interaction.guild.id} "
-        f"channel_id={voice_channel.id} "
-        f"ws_type={type(ws).__name__ if ws is not None else None} "
-        f"elapsed_s={readiness_elapsed:.3f} "
-        f"used_reconnect_path={connected_here} "
-        f"ready={ready}"
+    logger.info(
+        "transcribe_voice_readiness elapsed_s=%.3f used_reconnect_path=%s ready=%s ws_type=%s context=%r",
+        readiness_elapsed,
+        connected_here,
+        ready,
+        type(ws).__name__ if ws is not None else None,
+        build_interaction_log_context(interaction, vc=vc),
     )
     if not ready:
-        print(f"[transcribe] voice client not ready after wait: {describe_voice_client_state(vc)}")
+        logger.warning("transcribe_voice_not_ready context=%r", build_interaction_log_context(interaction, vc=vc))
         if connected_here:
             try:
                 await vc.disconnect(force=True)
@@ -1735,7 +1841,7 @@ async def gtranscribe(interaction: discord.Interaction):
             interaction.channel,
         )
     except Exception as exc:
-        print(f"[transcribe] start_recording failed: {type(exc).__name__}: {exc}")
+        logger.exception("transcribe_start_recording_failed error_type=%s context=%r", type(exc).__name__, build_interaction_log_context(interaction, vc=vc, session=session))
         shutil.rmtree(session.temp_dir, ignore_errors=True)
         if connected_here:
             try:
@@ -1748,6 +1854,7 @@ async def gtranscribe(interaction: discord.Interaction):
         )
         return
     transcription_sessions[interaction.guild.id] = session
+    logger.info("transcribe_session_started context=%r", build_interaction_log_context(interaction, vc=vc, session=session))
     await interaction.followup.send(
         f"🎙️ Started transcription capture in {voice_channel.mention}. Use `/gendsession` when you're done.",
         ephemeral=True,
@@ -1786,6 +1893,7 @@ async def gendsession(interaction: discord.Interaction):
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
     session = get_transcription_session(interaction.guild.id)
+    logger.info("transcribe_end_command_start context=%r", build_interaction_log_context(interaction, vc=interaction.guild.voice_client, session=session))
     if session is None:
         await interaction.response.send_message(
             "No active transcription session in this server.",
@@ -1811,10 +1919,12 @@ async def gendsession(interaction: discord.Interaction):
     except (discord.HTTPException, discord.ClientException):
         pass
     if transcript_path is None:
+        logger.error("transcribe_finalize_failed error=%s context=%r", error_message, build_interaction_log_context(interaction, vc=vc, session=session))
         remove_transcription_session(interaction.guild.id)
-        await interaction.followup.send(f"⚠️ Session ended, but transcript export failed: {error_message}", ephemeral=True)
+        await interaction.followup.send("⚠️ Session ended, but transcript export failed.", ephemeral=True)
         return
     transcript_file = discord.File(str(transcript_path), filename=transcript_path.name)
+    logger.info("transcribe_session_finished transcript=%s context=%r", transcript_path, build_interaction_log_context(interaction, vc=vc, session=session))
     await interaction.followup.send(
         content="📝 Transcription session ended. Here is your transcript file.",
         file=transcript_file,
@@ -1851,6 +1961,7 @@ async def gokibothelp(interaction: discord.Interaction):
 # =========================
 @bot.event
 async def on_ready():
+    register_loop_exception_handler(asyncio.get_running_loop())
     init_config_db()
     init_year_db(current_year_local())
     init_cleanup_db()
@@ -1873,7 +1984,7 @@ async def on_ready():
                 await post_button_for_guild(gid, cid)
             except (discord.Forbidden, discord.NotFound, discord.HTTPException):
                 continue
-    print(f"Logged in as {bot.user} (id={bot.user.id})")
+    logger.info("bot_ready user=%s user_id=%s", bot.user, bot.user.id)
 if not TOKEN or TOKEN == "PUT_TOKEN_HERE_FOR_TESTING":
     raise RuntimeError("Set DISCORD_TOKEN_POOPBOT env var or paste token into TOKEN.")
 bot.run(TOKEN)
