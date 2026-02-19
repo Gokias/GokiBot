@@ -582,7 +582,7 @@ async def ensure_voice_channel(interaction: discord.Interaction) -> discord.Voic
     return member.voice.channel
 
 
-async def wait_for_voice_client_ready(vc: discord.VoiceClient, timeout_seconds: float = 5.0) -> bool:
+async def wait_for_voice_client_ready(vc: discord.VoiceClient, timeout_seconds: float = 12.0) -> bool:
     """Wait for the voice websocket handshake to be ready for recording/playback."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -1668,7 +1668,7 @@ async def gtranscribe(interaction: discord.Interaction):
             except (discord.HTTPException, discord.ClientException):
                 pass
         await interaction.followup.send(
-            "I connected to voice, but Discord voice wasn't ready in time. Please try `/gtranscribe` again.",
+            "I connected to voice, but Discord voice setup took too long. Please try `/gtranscribe` again.",
             ephemeral=True,
         )
         return
