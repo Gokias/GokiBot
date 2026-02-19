@@ -16,12 +16,18 @@ Additional runtime dependencies used by this bot:
 - `PyNaCl==1.6.1` (voice transport encryption support)
 - `python-dotenv==1.2.1` (loads `.env` values)
 
+## Required for music
+Music playback and URL resolution commands depend on `yt-dlp` (installed from `requirements.txt`) and system `ffmpeg`.
+
+## Required for transcription export
+Transcript export uses a local Whisper backend. This project installs `faster-whisper` from `requirements.txt` (recommended backend).
+
 ## Raspberry Pi / Linux system packages
-Voice/music features require FFmpeg on the host:
+Voice/music features require FFmpeg and Opus on the host:
 
 ```bash
 sudo apt update
-sudo apt install -y ffmpeg
+sudo apt install -y ffmpeg libopus0
 ```
 
 ## Environment variables
