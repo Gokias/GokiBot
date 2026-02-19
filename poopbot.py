@@ -17,7 +17,7 @@ import ctypes.util
 import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone, date, time as dtime
+from datetime import datetime, timezone, date, time as dtime, timedelta
 from pathlib import Path
 import time
 import discord
@@ -149,6 +149,9 @@ FETCH_TRACK_INFO_TIMEOUT_SECONDS = 25
 FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
     "Timed out while fetching track info from YouTube. Please try again in a moment."
 )
+TRANSCRIBE_SLICE_SECONDS = max(int(os.getenv("TRANSCRIBE_SLICE_SECONDS", "12")), 5)
+TRANSCRIBE_CONSENT_EMOJI = "✅"
+TRANSCRIBE_CONSENT_VALID_DAYS = 180
 # =========================
 # MESSAGES
 # =========================
@@ -319,14 +322,24 @@ class GuildMusicState:
         self.lock = asyncio.Lock()
 music_states: dict[int, GuildMusicState] = {}
 class GuildTranscriptionSession:
-    def __init__(self, guild_id: int, voice_channel_id: int):
+    def __init__(self, guild_id: int, voice_channel_id: int, transcript_thread_id: int, consent_message_id: int):
         self.guild_id = guild_id
         self.voice_channel_id = voice_channel_id
+        self.transcript_thread_id = transcript_thread_id
+        self.consent_message_id = consent_message_id
         self.started_at = datetime.now(timezone.utc)
         self.temp_dir = Path(tempfile.mkdtemp(prefix=f"gokibot_transcribe_{guild_id}_"))
-        self.voice_paths_by_user: dict[int, Path] = {}
         self.aliases_by_user: dict[int, str] = {}
+        self.consented_user_ids: set[int] = set()
+        self.slice_number = 0
+        self.closed = False
+        self.loop_task: asyncio.Task | None = None
+        self.active_sink: object | None = None
+        self.active_slice_done = asyncio.Event()
+
+
 transcription_sessions: dict[int, GuildTranscriptionSession] = {}
+pending_transcription_name_prompts: dict[tuple[int, int], int] = {}
 def get_music_state(guild_id: int) -> GuildMusicState:
     state = music_states.get(guild_id)
     if state is None:
@@ -369,81 +382,220 @@ def get_whisper_transcriber() -> tuple[str | None, object | None]:
         model = whisper.load_model(model_name)
         return "whisper", model
     return None, None
-def transcribe_audio_file(engine_name: str, engine: object, file_path: Path) -> str:
+def transcribe_audio_file(engine_name: str, engine: object, file_path: Path) -> list[dict[str, object]]:
+    utterances: list[dict[str, object]] = []
     if engine_name == "faster_whisper":
         segments, _ = engine.transcribe(str(file_path), vad_filter=True)
-        return " ".join(seg.text.strip() for seg in segments if seg.text.strip())
+        for seg in segments:
+            phrase = (seg.text or "").strip()
+            if not phrase:
+                continue
+            utterances.append({
+                "start": float(getattr(seg, "start", 0.0) or 0.0),
+                "text": phrase,
+            })
+        return utterances
     if engine_name == "whisper":
         result = engine.transcribe(str(file_path), fp16=False)
-        return str(result.get("text") or "").strip()
-    return ""
-def copy_recorded_audio_to_session(
-    sink: object,
-    guild: discord.Guild,
-    session: GuildTranscriptionSession,
-) -> dict[int, Path]:
+        segments = result.get("segments") if isinstance(result, dict) else None
+        if isinstance(segments, list):
+            for seg in segments:
+                if not isinstance(seg, dict):
+                    continue
+                phrase = str(seg.get("text") or "").strip()
+                if not phrase:
+                    continue
+                utterances.append({
+                    "start": float(seg.get("start") or 0.0),
+                    "text": phrase,
+                })
+        else:
+            text_value = str((result or {}).get("text") or "").strip() if isinstance(result, dict) else ""
+            if text_value:
+                utterances.append({"start": 0.0, "text": text_value})
+    return utterances
+
+
+def normalize_transcript_display_name(name: str) -> str:
+    compact = " ".join(name.split()).strip()
+    return compact[:64]
+
+
+def transcription_consent_is_active(consented_at: str | None, expires_at: str | None) -> bool:
+    if not consented_at or not expires_at:
+        return False
+    try:
+        consented_dt = datetime.fromisoformat(consented_at)
+        expires_dt = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return False
+    if consented_dt.tzinfo is None:
+        consented_dt = consented_dt.replace(tzinfo=timezone.utc)
+    if expires_dt.tzinfo is None:
+        expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) <= expires_dt
+
+
+def get_active_transcription_consent(guild_id: int, user_id: int) -> tuple[str | None, str | None, str | None]:
+    with db_config() as conn:
+        row = conn.execute(
+            """
+            SELECT display_name, consented_at_utc, expires_at_utc
+            FROM transcription_consent
+            WHERE guild_id=? AND user_id=?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+    if not row:
+        return None, None, None
+    display_name = normalize_transcript_display_name(str(row["display_name"] or ""))
+    consented_at = row["consented_at_utc"]
+    expires_at = row["expires_at_utc"]
+    if not transcription_consent_is_active(consented_at, expires_at):
+        return None, consented_at, expires_at
+    if not display_name:
+        return None, consented_at, expires_at
+    return display_name, consented_at, expires_at
+
+
+async def upsert_transcription_consent(guild_id: int, user_id: int, display_name: str):
+    clean_name = normalize_transcript_display_name(display_name)
+    now_utc = datetime.now(timezone.utc)
+    expires = now_utc + timedelta(days=TRANSCRIBE_CONSENT_VALID_DAYS)
+    async with db_write_lock:
+        with db_config() as conn:
+            conn.execute(
+                """
+                INSERT INTO transcription_consent(
+                    guild_id, user_id, display_name, consented_at_utc, expires_at_utc
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    consented_at_utc=excluded.consented_at_utc,
+                    expires_at_utc=excluded.expires_at_utc
+                """,
+                (
+                    guild_id,
+                    user_id,
+                    clean_name,
+                    now_utc.isoformat(),
+                    expires.isoformat(),
+                ),
+            )
+
+
+def slice_timestamp_label(started_at: datetime, seconds_offset: float) -> str:
+    ts = started_at + timedelta(seconds=max(seconds_offset, 0.0))
+    return ts.astimezone(LOCAL_TZ).strftime("%H:%M:%S")
+
+
+def copy_recorded_audio_slice(sink: object, session: GuildTranscriptionSession) -> dict[int, Path]:
     copied_files: dict[int, Path] = {}
     sink_audio_data = getattr(sink, "audio_data", None)
     if not isinstance(sink_audio_data, dict):
         return copied_files
+    session.slice_number += 1
+    slice_dir = session.temp_dir / f"slice_{session.slice_number:05d}"
+    slice_dir.mkdir(parents=True, exist_ok=True)
     for user_id, audio_obj in sink_audio_data.items():
-        if not isinstance(user_id, int):
+        if not isinstance(user_id, int) or user_id not in session.consented_user_ids:
             continue
         file_path = getattr(audio_obj, "file", None)
         if file_path is None:
             continue
-        temp_output = session.temp_dir / f"{user_id}.wav"
+        output_file = slice_dir / f"{user_id}.wav"
         try:
             if hasattr(file_path, "seek"):
                 file_path.seek(0)
             if hasattr(file_path, "read"):
-                temp_output.write_bytes(file_path.read())
+                output_file.write_bytes(file_path.read())
             else:
-                shutil.copy(str(file_path), temp_output)
+                shutil.copy(str(file_path), output_file)
         except OSError:
             continue
-        copied_files[user_id] = temp_output
-    session.voice_paths_by_user = copied_files
-    logger.info(
-        "transcribe_audio_copied guild_id=%s voice_channel_id=%s temp_dir=%s captured_files=%s",
-        session.guild_id,
-        session.voice_channel_id,
-        session.temp_dir,
-        len(copied_files),
-    )
+        copied_files[user_id] = output_file
     return copied_files
-async def finalize_transcription_session(
-    interaction: discord.Interaction,
-    session: GuildTranscriptionSession,
-) -> tuple[Path | None, str]:
-    guild = interaction.guild
-    if guild is None:
-        return None, "This command only works in a server."
-    if not session.voice_paths_by_user:
-        return None, "No captured audio was found for this session."
+
+
+async def post_transcription_slice_lines(guild: discord.Guild, session: GuildTranscriptionSession, copied_files: dict[int, Path]):
+    if not copied_files:
+        return
     engine_name, engine = get_whisper_transcriber()
     if engine is None or engine_name is None:
-        return None, (
-            "No local transcription engine was found. Install dependencies with "
-            "`pip install -r requirements.txt` (includes `faster-whisper`)."
-        )
-    transcript_path = session.temp_dir / f"transcript-{guild.id}-{int(time.time())}.txt"
-    lines = [
-        f"GokiBot transcription session for guild {guild.id}",
-        f"Started UTC: {session.started_at.isoformat()}",
-        f"Ended UTC: {datetime.now(timezone.utc).isoformat()}",
-        "",
-    ]
-    for user_id, audio_path in sorted(session.voice_paths_by_user.items(), key=lambda item: item[0]):
+        return
+    thread = guild.get_thread(session.transcript_thread_id)
+    if thread is None:
+        fetched = guild.get_channel(session.transcript_thread_id)
+        if isinstance(fetched, discord.Thread):
+            thread = fetched
+    if thread is None:
+        return
+    ordered_lines: list[tuple[float, str]] = []
+    for user_id, audio_path in copied_files.items():
         speaker_name = resolve_display_name(guild, user_id, session.aliases_by_user)
-        transcript = transcribe_audio_file(engine_name, engine, audio_path)
-        if not transcript:
-            transcript = "[No speech detected]"
-        lines.append(f"[{speaker_name} | {user_id}]")
-        lines.append(transcript)
-        lines.append("")
-    transcript_path.write_text("\n".join(lines), encoding="utf-8")
-    return transcript_path, ""
+        utterances = transcribe_audio_file(engine_name, engine, audio_path)
+        for utterance in utterances:
+            phrase = str(utterance.get("text") or "").strip()
+            if not phrase:
+                continue
+            start_sec = float(utterance.get("start") or 0.0)
+            stamp = slice_timestamp_label(session.started_at, ((session.slice_number - 1) * TRANSCRIBE_SLICE_SECONDS) + start_sec)
+            ordered_lines.append((start_sec, f"[{stamp}] [{speaker_name}] {phrase}"))
+    ordered_lines.sort(key=lambda item: item[0])
+    if not ordered_lines:
+        return
+    for _, line in ordered_lines:
+        await thread.send(line)
+
+
+async def finalize_recording_slice(vc: discord.VoiceClient, guild: discord.Guild, session: GuildTranscriptionSession):
+    if not getattr(vc, "recording", False):
+        return
+    done_event = asyncio.Event()
+    session.active_slice_done = done_event
+
+    def _slice_finished(sink: object, channel: object, *_: object):
+        copied = copy_recorded_audio_slice(sink, session)
+        fut = asyncio.run_coroutine_threadsafe(post_transcription_slice_lines(guild, session, copied), bot.loop)
+        try:
+            fut.result(timeout=90)
+        except Exception:
+            logger.exception("transcribe_slice_post_failed guild_id=%s", guild.id)
+        done_event.set()
+
+    try:
+        vc.stop_recording()
+    except Exception:
+        logger.exception("transcribe_slice_stop_failed guild_id=%s", guild.id)
+        done_event.set()
+    await asyncio.wait_for(done_event.wait(), timeout=120)
+    if session.closed:
+        return
+    try:
+        new_sink = discord.sinks.WaveSink()
+        session.active_sink = new_sink
+        vc.start_recording(new_sink, _slice_finished, None)
+    except Exception:
+        logger.exception("transcribe_slice_restart_failed guild_id=%s", guild.id)
+
+
+async def transcription_live_loop(guild_id: int):
+    while True:
+        await asyncio.sleep(TRANSCRIBE_SLICE_SECONDS)
+        session = get_transcription_session(guild_id)
+        if session is None or session.closed:
+            return
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            continue
+        vc = guild.voice_client
+        if vc is None or not vc.is_connected() or not getattr(vc, "recording", False):
+            continue
+        try:
+            await finalize_recording_slice(vc, guild, session)
+        except asyncio.TimeoutError:
+            logger.warning("transcribe_slice_timeout guild_id=%s", guild_id)
+
 def format_duration(duration_seconds: int) -> str:
     mins, secs = divmod(max(duration_seconds, 0), 60)
     hours, mins = divmod(mins, 60)
@@ -694,8 +846,12 @@ def describe_voice_client_state(vc: discord.VoiceClient) -> str:
 def describe_transcription_session_state(session: GuildTranscriptionSession | None) -> str:
     if session is None:
         return "session=none"
-    file_count = len(session.voice_paths_by_user)
-    return f"temp_dir={session.temp_dir} captured_files={file_count}"
+    return (
+        f"temp_dir={session.temp_dir} "
+        f"slice={session.slice_number} "
+        f"consented={len(session.consented_user_ids)} "
+        f"thread_id={session.transcript_thread_id}"
+    )
 
 
 def build_interaction_log_context(
@@ -828,6 +984,16 @@ def init_config_db():
             added_by_id INTEGER NOT NULL,
             added_at_utc TEXT NOT NULL,
             PRIMARY KEY (ticket_id, user_id)
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS transcription_consent (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            display_name TEXT NOT NULL,
+            consented_at_utc TEXT NOT NULL,
+            expires_at_utc TEXT NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
         );
         """)
         columns = {
@@ -1243,8 +1409,27 @@ async def wesroth_upload_watch():
 # =========================
 @bot.event
 async def on_message(message: discord.Message):
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+    if isinstance(message.channel, discord.DMChannel):
+        prompt_guild_id = pending_transcription_name_prompts.pop((message.author.id, message.channel.id), None)
+        if prompt_guild_id is not None:
+            chosen_name = normalize_transcript_display_name(message.content)
+            if not chosen_name:
+                await message.channel.send("Display name cannot be empty. React again in the consent thread to retry.")
+                return
+            await upsert_transcription_consent(prompt_guild_id, message.author.id, chosen_name)
+            session = get_transcription_session(prompt_guild_id)
+            if session is not None:
+                session.consented_user_ids.add(message.author.id)
+                session.aliases_by_user[message.author.id] = chosen_name
+            await message.channel.send(
+                f"✅ Consent recorded for this server. Your transcript display name is **{chosen_name}** for the next {TRANSCRIBE_CONSENT_VALID_DAYS} days."
+            )
+            return
     # delete any non-bot message in the cleanup channel
-    if message.channel.id == CLEANUP_CHANNEL_ID and not message.author.bot:
+    if message.channel.id == CLEANUP_CHANNEL_ID:
         try:
             await log_cleanup_message(message)
             await message.delete()
@@ -1262,10 +1447,24 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
     if payload.guild_id is None:
         return
+    emoji = str(payload.emoji)
+    session = get_transcription_session(payload.guild_id)
+    if session is not None and emoji == TRANSCRIBE_CONSENT_EMOJI and payload.message_id == session.consent_message_id:
+        guild = bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        member = guild.get_member(payload.user_id)
+        if member is None or member.bot:
+            return
+        dm_channel = member.dm_channel or await member.create_dm()
+        pending_transcription_name_prompts[(member.id, dm_channel.id)] = payload.guild_id
+        await dm_channel.send(
+            "You reacted to transcription consent. Please reply with the display name you want shown in transcripts."
+        )
+        return
     active_message_id = gget(payload.guild_id, "active_message_id")
     if not active_message_id or str(payload.message_id) != active_message_id:
         return
-    emoji = str(payload.emoji)
     channel = await bot.fetch_channel(payload.channel_id)
     message = await channel.fetch_message(payload.message_id)
     user = await bot.fetch_user(payload.user_id)
@@ -1746,10 +1945,10 @@ async def gskip(interaction: discord.Interaction):
     vc.stop()
     await interaction.response.send_message("⏭️ Skipped current track.", ephemeral=True)
 @discord.guild_only()
-@bot.slash_command(name="gtranscribe", description="Join your voice channel and start recording speakers for transcription.")
+@bot.slash_command(name="gtranscribe", description="Join your voice channel and start live transcription in a consent thread.")
 async def gtranscribe(interaction: discord.Interaction):
     logger.info("transcribe_command_start context=%r", build_interaction_log_context(interaction, vc=getattr(getattr(interaction, "guild", None), "voice_client", None)))
-    if interaction.guild is None:
+    if interaction.guild is None or interaction.channel is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
     can_record, record_error = can_record_voice()
@@ -1766,15 +1965,36 @@ async def gtranscribe(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-    existing = get_transcription_session(interaction.guild.id)
-    if existing is not None:
+    if get_transcription_session(interaction.guild.id) is not None:
         await interaction.response.send_message(
             "A transcription session is already active in this server. Use `/gendsession` first.",
             ephemeral=True,
         )
         return
     await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send("Working…", ephemeral=True)
+
+    start_label = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+    transcript_thread = await interaction.channel.create_thread(
+        name=f"transcript-{start_label}",
+        type=discord.ChannelType.private_thread,
+    )
+    for member in voice_channel.members:
+        if member.bot:
+            continue
+        try:
+            await transcript_thread.add_user(member)
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+    consent_message = await transcript_thread.send(
+        (
+            f"🎙️ **Transcription session started** for {voice_channel.mention}.\n"
+            f"React with {TRANSCRIBE_CONSENT_EMOJI} to consent to recording/transcription.\n"
+            "After reacting, I will DM you to collect your transcript display name.\n"
+            f"Consent expires after {TRANSCRIBE_CONSENT_VALID_DAYS} days."
+        )
+    )
+    await consent_message.add_reaction(TRANSCRIBE_CONSENT_EMOJI)
+
     vc = interaction.guild.voice_client
     connected_here = False
     if vc is not None and vc.channel != voice_channel:
@@ -1797,20 +2017,8 @@ async def gtranscribe(interaction: discord.Interaction):
     if vc is None:
         await interaction.followup.send("I couldn't initialize a voice client.", ephemeral=True)
         return
-    ready_check_started = time.monotonic()
     ready = await wait_for_voice_client_ready(vc)
-    readiness_elapsed = time.monotonic() - ready_check_started
-    ws = getattr(vc, "ws", None)
-    logger.info(
-        "transcribe_voice_readiness elapsed_s=%.3f used_reconnect_path=%s ready=%s ws_type=%s context=%r",
-        readiness_elapsed,
-        connected_here,
-        ready,
-        type(ws).__name__ if ws is not None else None,
-        build_interaction_log_context(interaction, vc=vc),
-    )
     if not ready:
-        logger.warning("transcribe_voice_not_ready context=%r", build_interaction_log_context(interaction, vc=vc))
         if connected_here:
             try:
                 await vc.disconnect(force=True)
@@ -1824,25 +2032,33 @@ async def gtranscribe(interaction: discord.Interaction):
     if getattr(vc, "recording", False):
         await interaction.followup.send("I am already recording in this server.", ephemeral=True)
         return
-    session = GuildTranscriptionSession(interaction.guild.id, voice_channel.id)
-    def _recording_finished(sink: object, channel: object, *_: object):
-        guild = interaction.guild
-        if guild is None:
-            return
-        active_session = get_transcription_session(guild.id)
-        if active_session is None:
-            return
-        copy_recorded_audio_to_session(sink, guild, active_session)
+
+    session = GuildTranscriptionSession(interaction.guild.id, voice_channel.id, transcript_thread.id, consent_message.id)
+    for member in voice_channel.members:
+        if member.bot:
+            continue
+        display_name, _, _ = get_active_transcription_consent(interaction.guild.id, member.id)
+        if display_name:
+            session.consented_user_ids.add(member.id)
+            session.aliases_by_user[member.id] = display_name
+    transcription_sessions[interaction.guild.id] = session
+
+    def _slice_finished(sink: object, channel: object, *_: object):
+        copied = copy_recorded_audio_slice(sink, session)
+        fut = asyncio.run_coroutine_threadsafe(post_transcription_slice_lines(interaction.guild, session, copied), bot.loop)
+        try:
+            fut.result(timeout=90)
+        except Exception:
+            logger.exception("transcribe_slice_post_failed guild_id=%s", interaction.guild.id)
+        session.active_slice_done.set()
+
     try:
         sink = discord.sinks.WaveSink()
-        vc.start_recording(
-            sink,
-            _recording_finished,
-            interaction.channel,
-        )
+        session.active_sink = sink
+        vc.start_recording(sink, _slice_finished, None)
     except Exception as exc:
         logger.exception("transcribe_start_recording_failed error_type=%s context=%r", type(exc).__name__, build_interaction_log_context(interaction, vc=vc, session=session))
-        shutil.rmtree(session.temp_dir, ignore_errors=True)
+        remove_transcription_session(interaction.guild.id)
         if connected_here:
             try:
                 await vc.disconnect(force=True)
@@ -1853,47 +2069,45 @@ async def gtranscribe(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-    transcription_sessions[interaction.guild.id] = session
-    logger.info("transcribe_session_started context=%r", build_interaction_log_context(interaction, vc=vc, session=session))
+
+    session.loop_task = asyncio.create_task(transcription_live_loop(interaction.guild.id))
     await interaction.followup.send(
-        f"🎙️ Started transcription capture in {voice_channel.mention}. Use `/gendsession` when you're done.",
+        f"🎙️ Live transcription started in {voice_channel.mention}. Updates will be posted in {transcript_thread.mention}.",
         ephemeral=True,
     )
-@discord.guild_only()
-@bot.slash_command(name="gsetuser", description="Set a display alias for a Discord user id in the active transcription session.")
 
-async def gsetuser(
+
+@discord.guild_only()
+@bot.slash_command(name="gsetname", description="Set your transcription display name and renew consent.")
+async def gsetname(
     interaction: discord.Interaction,
-    user: discord.Option(discord.Member, "User to alias"),
-    name: discord.Option(str, "Alias to write in the transcript"),
+    name: discord.Option(str, "Display name to use in transcripts"),
 ):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
+    clean_name = normalize_transcript_display_name(name)
+    if not clean_name:
+        await interaction.response.send_message("Display name cannot be empty.", ephemeral=True)
+        return
+    await upsert_transcription_consent(interaction.guild.id, interaction.user.id, clean_name)
     session = get_transcription_session(interaction.guild.id)
-    if session is None:
-        await interaction.response.send_message(
-            "No active transcription session. Start one with `/gtranscribe`.",
-            ephemeral=True,
-        )
-        return
-    alias = name.strip()
-    if not alias:
-        await interaction.response.send_message("Alias cannot be empty.", ephemeral=True)
-        return
-    session.aliases_by_user[user.id] = alias
+    if session is not None:
+        session.consented_user_ids.add(interaction.user.id)
+        session.aliases_by_user[interaction.user.id] = clean_name
     await interaction.response.send_message(
-        f"✅ Transcript alias set: `{user.id}` → **{alias}**",
+        f"✅ Saved transcript display name **{clean_name}** and renewed consent for {TRANSCRIBE_CONSENT_VALID_DAYS} days.",
         ephemeral=True,
     )
+
+
 @discord.guild_only()
-@bot.slash_command(name="gendsession", description="Stop recording and export the transcript text file.")
+@bot.slash_command(name="gendsession", description="Stop live transcription and disconnect from voice.")
 async def gendsession(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
     session = get_transcription_session(interaction.guild.id)
-    logger.info("transcribe_end_command_start context=%r", build_interaction_log_context(interaction, vc=interaction.guild.voice_client, session=session))
     if session is None:
         await interaction.response.send_message(
             "No active transcription session in this server.",
@@ -1901,36 +2115,27 @@ async def gendsession(interaction: discord.Interaction):
         )
         return
     vc = interaction.guild.voice_client
-    if vc is None or not vc.is_connected():
-        remove_transcription_session(interaction.guild.id)
-        await interaction.response.send_message(
-            "The voice session was already disconnected, so no recording could be finalized.",
-            ephemeral=True,
-        )
-        return
     await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send("Working…", ephemeral=True)
-    if getattr(vc, "recording", False):
-        vc.stop_recording()
-        await asyncio.sleep(1)
-    transcript_path, error_message = await finalize_transcription_session(interaction, session)
-    try:
-        await vc.disconnect(force=True)
-    except (discord.HTTPException, discord.ClientException):
-        pass
-    if transcript_path is None:
-        logger.error("transcribe_finalize_failed error=%s context=%r", error_message, build_interaction_log_context(interaction, vc=vc, session=session))
-        remove_transcription_session(interaction.guild.id)
-        await interaction.followup.send("⚠️ Session ended, but transcript export failed.", ephemeral=True)
-        return
-    transcript_file = discord.File(str(transcript_path), filename=transcript_path.name)
-    logger.info("transcribe_session_finished transcript=%s context=%r", transcript_path, build_interaction_log_context(interaction, vc=vc, session=session))
-    await interaction.followup.send(
-        content="📝 Transcription session ended. Here is your transcript file.",
-        file=transcript_file,
-        ephemeral=True,
-    )
+    if vc is not None and vc.is_connected() and getattr(vc, "recording", False):
+        try:
+            session.closed = True
+            await finalize_recording_slice(vc, interaction.guild, session)
+        except asyncio.TimeoutError:
+            logger.warning("transcribe_final_slice_timeout guild_id=%s", interaction.guild.id)
+    if session.loop_task is not None:
+        session.loop_task.cancel()
+    if vc is not None and vc.is_connected():
+        try:
+            await vc.disconnect(force=True)
+        except (discord.HTTPException, discord.ClientException):
+            pass
+    thread = interaction.guild.get_thread(session.transcript_thread_id)
+    if thread is not None:
+        await thread.send("🛑 Transcription session ended. Bot disconnected from voice.")
     remove_transcription_session(interaction.guild.id)
+    await interaction.followup.send("✅ Transcription session ended and bot disconnected.", ephemeral=True)
+
+
 @bot.slash_command(name="gokibothelp", description="Show all available GokiBot commands.")
 async def gokibothelp(interaction: discord.Interaction):
     command_lines = [
@@ -1941,9 +2146,9 @@ async def gokibothelp(interaction: discord.Interaction):
         "- `/gplay <youtube_link_or_search>` — Queue and play YouTube audio.",
         "- `/gqueue` — Show the current playback queue.",
         "- `/gskip` — Skip the currently playing track.",
-        "- `/gtranscribe` — Start recording and isolate speakers for transcription.",
-        "- `/gsetuser <user> <name>` — Alias a Discord user in transcript output.",
-        "- `/gendsession` — Stop recording and export transcript text.",
+        "- `/gtranscribe` — Start live transcription in a timestamped consent thread.",
+        "- `/gsetname <name>` — Set your transcript display name and renew consent.",
+        "- `/gendsession` — Stop live transcription and disconnect.",
         "- `/gokibothelp` — Show this help message."
     ]
     if is_dev_user(interaction.user.id):
