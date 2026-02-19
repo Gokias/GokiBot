@@ -586,21 +586,20 @@ async def wait_for_voice_client_ready(vc: discord.VoiceClient, timeout_seconds: 
     """Wait for the voice websocket handshake to be ready for recording/playback."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        if not vc.is_connected():
-            return False
-
+        connected = vc.is_connected()
         connected_event = getattr(vc, "_connected", None)
-        if connected_event is not None and hasattr(connected_event, "is_set") and connected_event.is_set():
-            return True
+        connected_event_set = (
+            connected_event is not None and hasattr(connected_event, "is_set") and connected_event.is_set()
+        )
 
         ws = getattr(vc, "ws", None)
-        if ws is not None and callable(getattr(ws, "poll_event", None)):
+        ws_poll_ready = ws is not None and callable(getattr(ws, "poll_event", None))
+
+        if connected and (ws_poll_ready or connected_event_set):
             return True
 
-        if getattr(vc, "channel", None) is not None and getattr(vc, "guild", None) is not None:
-            guild_voice_client = vc.guild.voice_client
-            if guild_voice_client is vc:
-                return True
+        if not connected:
+            return False
 
         await asyncio.sleep(0.1)
     return False
@@ -1691,7 +1690,20 @@ async def gtranscribe(interaction: discord.Interaction):
     if vc is None:
         await interaction.followup.send("I couldn't initialize a voice client.", ephemeral=True)
         return
-    if not await wait_for_voice_client_ready(vc):
+    ready_check_started = time.monotonic()
+    ready = await wait_for_voice_client_ready(vc)
+    readiness_elapsed = time.monotonic() - ready_check_started
+    ws = getattr(vc, "ws", None)
+    print(
+        "[transcribe] voice readiness "
+        f"guild_id={interaction.guild.id} "
+        f"channel_id={voice_channel.id} "
+        f"ws_type={type(ws).__name__ if ws is not None else None} "
+        f"elapsed_s={readiness_elapsed:.3f} "
+        f"used_reconnect_path={connected_here} "
+        f"ready={ready}"
+    )
+    if not ready:
         print(f"[transcribe] voice client not ready after wait: {describe_voice_client_state(vc)}")
         if connected_here:
             try:
