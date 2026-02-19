@@ -11,6 +11,7 @@ import json
 import tempfile
 import shutil
 import importlib.util
+import ctypes.util
 import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
@@ -25,11 +26,18 @@ try:
 except ImportError:
     raise RuntimeError("Python 3.9+ required for zoneinfo")
 # Ensure Opus is available for voice/recording on Linux
-try:
-    if not discord.opus.is_loaded():
-        discord.opus.load_opus("libopus.so.0")
-except Exception as e:
-    print(f"[voice] Failed to load Opus: {e}")
+_OPUS_LOAD_ERROR: str | None = None
+if not discord.opus.is_loaded():
+    for opus_lib_name in ("libopus.so.0", "libopus.so", ctypes.util.find_library("opus")):
+        if not opus_lib_name:
+            continue
+        try:
+            discord.opus.load_opus(opus_lib_name)
+            break
+        except Exception as e:
+            _OPUS_LOAD_ERROR = str(e)
+if not discord.opus.is_loaded() and _OPUS_LOAD_ERROR:
+    print(f"[voice] Failed to load Opus: {_OPUS_LOAD_ERROR}")
 
 # =========================
 # CONFIG
@@ -276,8 +284,14 @@ def resolve_display_name(guild: discord.Guild | None, user_id: int, aliases_by_u
         if member is not None:
             return member.display_name
     return str(user_id)
-def can_record_voice() -> bool:
-    return hasattr(discord, "sinks") and hasattr(discord.sinks, "WaveSink")
+def can_record_voice() -> tuple[bool, str]:
+    if not hasattr(discord, "sinks") or not hasattr(discord.sinks, "WaveSink"):
+        return False, "This runtime is missing discord voice sinks support."
+    if importlib.util.find_spec("nacl") is None:
+        return False, "PyNaCl is not installed in this Python environment."
+    if not discord.opus.is_loaded():
+        return False, "Opus is not loaded (missing libopus on host)."
+    return True, ""
 def get_whisper_transcriber() -> tuple[str | None, object | None]:
     if importlib.util.find_spec("faster_whisper") is not None:
         from faster_whisper import WhisperModel
@@ -1589,9 +1603,10 @@ async def gtranscribe(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
-    if not can_record_voice():
+    can_record, record_error = can_record_voice()
+    if not can_record:
         await interaction.response.send_message(
-            "This bot runtime does not support Discord voice recording (missing `discord.sinks`).",
+            f"Voice recording is unavailable: {record_error} Install dependencies with `pip install -r requirements.txt` and ensure system Opus is installed (for Debian/Ubuntu: `sudo apt install libopus0`).",
             ephemeral=True,
         )
         return
@@ -1661,7 +1676,7 @@ async def gtranscribe(interaction: discord.Interaction):
             except (discord.HTTPException, discord.ClientException):
                 pass
         await interaction.followup.send(
-            f"I joined voice but couldn't start recording: `{type(exc).__name__}`. Ensure Opus/PyNaCl are available on the host.",
+            f"I joined voice but couldn't start recording: `{type(exc).__name__}`. Ensure `PyNaCl` is installed in the bot venv and system Opus is available (`libopus0`/`libopus.so`).",
             ephemeral=True,
         )
         return
