@@ -150,7 +150,6 @@ FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
     "Timed out while fetching track info from YouTube. Please try again in a moment."
 )
 TRANSCRIBE_SLICE_SECONDS = max(int(os.getenv("TRANSCRIBE_SLICE_SECONDS", "12")), 5)
-TRANSCRIBE_CONSENT_EMOJI = "✅"
 TRANSCRIBE_CONSENT_VALID_DAYS = 180
 # =========================
 # MESSAGES
@@ -322,15 +321,15 @@ class GuildMusicState:
         self.lock = asyncio.Lock()
 music_states: dict[int, GuildMusicState] = {}
 class GuildTranscriptionSession:
-    def __init__(self, guild_id: int, voice_channel_id: int, transcript_thread_id: int, consent_message_id: int):
+    def __init__(self, guild_id: int, voice_channel_id: int, transcript_thread_id: int):
         self.guild_id = guild_id
         self.voice_channel_id = voice_channel_id
         self.transcript_thread_id = transcript_thread_id
-        self.consent_message_id = consent_message_id
         self.started_at = datetime.now(timezone.utc)
         self.temp_dir = Path(tempfile.mkdtemp(prefix=f"gokibot_transcribe_{guild_id}_"))
         self.aliases_by_user: dict[int, str] = {}
         self.consented_user_ids: set[int] = set()
+        self.dm_prompted_user_ids: set[int] = set()
         self.slice_number = 0
         self.closed = False
         self.loop_task: asyncio.Task | None = None
@@ -339,7 +338,6 @@ class GuildTranscriptionSession:
 
 
 transcription_sessions: dict[int, GuildTranscriptionSession] = {}
-pending_transcription_name_prompts: dict[tuple[int, int], int] = {}
 def get_music_state(guild_id: int) -> GuildMusicState:
     state = music_states.get(guild_id)
     if state is None:
@@ -482,6 +480,13 @@ async def upsert_transcription_consent(guild_id: int, user_id: int, display_name
                     expires.isoformat(),
                 ),
             )
+
+
+async def send_transcription_consent_dm(guild: discord.Guild, member: discord.Member):
+    dm_channel = member.dm_channel or await member.create_dm()
+    await dm_channel.send(
+        f"🎙️ Live transcription is active in **{guild.name}**. To change your display name, run `/gsetname <display name>` in the server."
+    )
 
 
 def slice_timestamp_label(started_at: datetime, seconds_offset: float) -> str:
@@ -1412,22 +1417,6 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         await bot.process_commands(message)
         return
-    if isinstance(message.channel, discord.DMChannel):
-        prompt_guild_id = pending_transcription_name_prompts.pop((message.author.id, message.channel.id), None)
-        if prompt_guild_id is not None:
-            chosen_name = normalize_transcript_display_name(message.content)
-            if not chosen_name:
-                await message.channel.send("Display name cannot be empty. React again in the consent thread to retry.")
-                return
-            await upsert_transcription_consent(prompt_guild_id, message.author.id, chosen_name)
-            session = get_transcription_session(prompt_guild_id)
-            if session is not None:
-                session.consented_user_ids.add(message.author.id)
-                session.aliases_by_user[message.author.id] = chosen_name
-            await message.channel.send(
-                f"✅ Consent recorded for this server. Your transcript display name is **{chosen_name}** for the next {TRANSCRIBE_CONSENT_VALID_DAYS} days."
-            )
-            return
     # delete any non-bot message in the cleanup channel
     if message.channel.id == CLEANUP_CHANNEL_ID:
         try:
@@ -1438,6 +1427,30 @@ async def on_message(message: discord.Message):
         # still allow commands processing elsewhere; this message is gone anyway
         return
     await bot.process_commands(message)
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.bot or member.guild is None:
+        return
+    session = get_transcription_session(member.guild.id)
+    if session is None or session.closed:
+        return
+    if after.channel is None or after.channel.id != session.voice_channel_id:
+        return
+    if before.channel is not None and before.channel.id == session.voice_channel_id:
+        return
+    display_name, _, _ = get_active_transcription_consent(member.guild.id, member.id)
+    if display_name:
+        session.consented_user_ids.add(member.id)
+        session.aliases_by_user[member.id] = display_name
+        return
+    if member.id in session.dm_prompted_user_ids:
+        return
+    try:
+        await send_transcription_consent_dm(member.guild, member)
+        session.dm_prompted_user_ids.add(member.id)
+    except (discord.Forbidden, discord.HTTPException):
+        return
+
 # =========================
 # REACTIONS
 # =========================
@@ -1448,20 +1461,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.guild_id is None:
         return
     emoji = str(payload.emoji)
-    session = get_transcription_session(payload.guild_id)
-    if session is not None and emoji == TRANSCRIBE_CONSENT_EMOJI and payload.message_id == session.consent_message_id:
-        guild = bot.get_guild(payload.guild_id)
-        if guild is None:
-            return
-        member = guild.get_member(payload.user_id)
-        if member is None or member.bot:
-            return
-        dm_channel = member.dm_channel or await member.create_dm()
-        pending_transcription_name_prompts[(member.id, dm_channel.id)] = payload.guild_id
-        await dm_channel.send(
-            "You reacted to transcription consent. Please reply with the display name you want shown in transcripts."
-        )
-        return
     active_message_id = gget(payload.guild_id, "active_message_id")
     if not active_message_id or str(payload.message_id) != active_message_id:
         return
@@ -1945,7 +1944,7 @@ async def gskip(interaction: discord.Interaction):
     vc.stop()
     await interaction.response.send_message("⏭️ Skipped current track.", ephemeral=True)
 @discord.guild_only()
-@bot.slash_command(name="gtranscribe", description="Join your voice channel and start live transcription in a consent thread.")
+@bot.slash_command(name="gtranscribe", description="Join your voice channel and start live transcription in a transcript thread.")
 async def gtranscribe(interaction: discord.Interaction):
     logger.info("transcribe_command_start context=%r", build_interaction_log_context(interaction, vc=getattr(getattr(interaction, "guild", None), "voice_client", None)))
     if interaction.guild is None or interaction.channel is None:
@@ -1985,15 +1984,13 @@ async def gtranscribe(interaction: discord.Interaction):
             await transcript_thread.add_user(member)
         except (discord.Forbidden, discord.HTTPException):
             continue
-    consent_message = await transcript_thread.send(
+    await transcript_thread.send(
         (
-            f"🎙️ **Transcription session started** for {voice_channel.mention}.\n"
-            f"React with {TRANSCRIBE_CONSENT_EMOJI} to consent to recording/transcription.\n"
-            "After reacting, I will DM you to collect your transcript display name.\n"
-            f"Consent expires after {TRANSCRIBE_CONSENT_VALID_DAYS} days."
+            f"🎙️ **Transcription session has begun** for {voice_channel.mention}.\n"
+            "If you have not already consented, check your DMs and run `/gsetname <display name>`."
         )
     )
-    await consent_message.add_reaction(TRANSCRIBE_CONSENT_EMOJI)
+
 
     vc = interaction.guild.voice_client
     connected_here = False
@@ -2033,7 +2030,7 @@ async def gtranscribe(interaction: discord.Interaction):
         await interaction.followup.send("I am already recording in this server.", ephemeral=True)
         return
 
-    session = GuildTranscriptionSession(interaction.guild.id, voice_channel.id, transcript_thread.id, consent_message.id)
+    session = GuildTranscriptionSession(interaction.guild.id, voice_channel.id, transcript_thread.id)
     for member in voice_channel.members:
         if member.bot:
             continue
@@ -2041,6 +2038,12 @@ async def gtranscribe(interaction: discord.Interaction):
         if display_name:
             session.consented_user_ids.add(member.id)
             session.aliases_by_user[member.id] = display_name
+            continue
+        try:
+            await send_transcription_consent_dm(interaction.guild, member)
+            session.dm_prompted_user_ids.add(member.id)
+        except (discord.Forbidden, discord.HTTPException):
+            continue
     transcription_sessions[interaction.guild.id] = session
 
     def _slice_finished(sink: object, channel: object, *_: object):
@@ -2146,7 +2149,7 @@ async def gokibothelp(interaction: discord.Interaction):
         "- `/gplay <youtube_link_or_search>` — Queue and play YouTube audio.",
         "- `/gqueue` — Show the current playback queue.",
         "- `/gskip` — Skip the currently playing track.",
-        "- `/gtranscribe` — Start live transcription in a timestamped consent thread.",
+        "- `/gtranscribe` — Start live transcription in a timestamped transcript thread.",
         "- `/gsetname <name>` — Set your transcript display name and renew consent.",
         "- `/gendsession` — Stop live transcription and disconnect.",
         "- `/gokibothelp` — Show this help message."
