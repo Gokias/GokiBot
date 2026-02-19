@@ -1602,7 +1602,8 @@ async def gtranscribe(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send("Working…", ephemeral=True)
     vc = interaction.guild.voice_client
     connected_here = False
     if vc is not None and vc.channel != voice_channel:
