@@ -582,7 +582,7 @@ async def ensure_voice_channel(interaction: discord.Interaction) -> discord.Voic
     return member.voice.channel
 
 
-async def wait_for_voice_client_ready(vc: discord.VoiceClient, timeout_seconds: float = 12.0) -> bool:
+async def wait_for_voice_client_ready(vc: discord.VoiceClient, timeout_seconds: float = 120.0) -> bool:
     """Wait for the voice websocket handshake to be ready for recording/playback."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
