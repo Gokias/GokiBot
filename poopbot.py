@@ -1602,21 +1602,33 @@ async def gtranscribe(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
+    await interaction.response.defer(ephemeral=True, thinking=True)
     vc = interaction.guild.voice_client
+    connected_here = False
     if vc is not None and vc.channel != voice_channel:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"I am already connected to {vc.channel.mention}. Disconnect or move me first.",
             ephemeral=True,
         )
         return
     if vc is None or not vc.is_connected():
         try:
-            vc = await voice_channel.connect()
-        except (discord.ClientException, discord.HTTPException):
-            await interaction.response.send_message("I couldn't join your voice channel.", ephemeral=True)
+            vc = await voice_channel.connect(timeout=15.0, reconnect=True)
+            connected_here = True
+        except (discord.ClientException, discord.HTTPException, asyncio.TimeoutError) as exc:
+            print(f"[transcribe] voice connect failed: {type(exc).__name__}: {exc}")
+            await interaction.followup.send(
+                "I couldn't join your voice channel. Confirm I have **Connect/Speak** permissions and that PyNaCl is installed (`pip install -r requirements.txt`).",
+                ephemeral=True,
+            )
             return
+    if vc is None:
+        await interaction.followup.send("I couldn't initialize a voice client.", ephemeral=True)
+        return
+    if getattr(vc, "recording", False):
+        await interaction.followup.send("I am already recording in this server.", ephemeral=True)
+        return
     session = GuildTranscriptionSession(interaction.guild.id, voice_channel.id)
-    transcription_sessions[interaction.guild.id] = session
     def _recording_finished(sink: object, channel: object, *_: object):
         guild = interaction.guild
         if guild is None:
@@ -1625,13 +1637,28 @@ async def gtranscribe(interaction: discord.Interaction):
         if active_session is None:
             return
         copy_recorded_audio_to_session(sink, guild, active_session)
-    sink = discord.sinks.WaveSink()
-    vc.start_recording(
-        sink,
-        _recording_finished,
-        interaction.channel,
-    )
-    await interaction.response.send_message(
+    try:
+        sink = discord.sinks.WaveSink()
+        vc.start_recording(
+            sink,
+            _recording_finished,
+            interaction.channel,
+        )
+    except Exception as exc:
+        print(f"[transcribe] start_recording failed: {type(exc).__name__}: {exc}")
+        shutil.rmtree(session.temp_dir, ignore_errors=True)
+        if connected_here:
+            try:
+                await vc.disconnect(force=True)
+            except (discord.HTTPException, discord.ClientException):
+                pass
+        await interaction.followup.send(
+            f"I joined voice but couldn't start recording: `{type(exc).__name__}`. Ensure Opus/PyNaCl are available on the host.",
+            ephemeral=True,
+        )
+        return
+    transcription_sessions[interaction.guild.id] = session
+    await interaction.followup.send(
         f"🎙️ Started transcription capture in {voice_channel.mention}. Use `/gendsession` when you're done.",
         ephemeral=True,
     )
