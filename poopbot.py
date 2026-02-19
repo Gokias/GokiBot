@@ -18,7 +18,6 @@ from datetime import datetime, timezone, date, time as dtime
 from pathlib import Path
 import time
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
 try:
     from zoneinfo import ZoneInfo
@@ -1232,9 +1231,9 @@ def get_max_poops_in_one_day(user_id: int, year: int) -> tuple[int, str | None]:
 # =========================
 # COMMANDS (slash)
 # =========================
-@bot.tree.command(name="setpoopchannel", description="Set the poop logging channel for this server.")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.guild_only()
+@bot.slash_command(name="setpoopchannel", description="Set the poop logging channel for this server.")
+@discord.default_permissions(administrator=True)
+@discord.guild_only()
 async def setpoopchannel(interaction: discord.Interaction):
     if interaction.guild is None or interaction.channel is None:
         return
@@ -1242,17 +1241,17 @@ async def setpoopchannel(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"✅ Poop channel set to {interaction.channel.mention} for this server."
     )
-@bot.tree.command(name="disablepoop", description="Disable poop posting for this server.")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.guild_only()
+@bot.slash_command(name="disablepoop", description="Disable poop posting for this server.")
+@discord.default_permissions(administrator=True)
+@discord.guild_only()
 async def disablepoop(interaction: discord.Interaction):
     if interaction.guild is None:
         return
     disable_guild(interaction.guild.id)
     await interaction.response.send_message("🛑 Poop posting disabled for this server.")
-@bot.tree.command(name="debugpoop", description="Force-create a new poop button message.")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.guild_only()
+@bot.slash_command(name="debugpoop", description="Force-create a new poop button message.")
+@discord.default_permissions(administrator=True)
+@discord.guild_only()
 async def debugpoop(interaction: discord.Interaction):
     """Force-create a new poop button message in this guild's configured channel."""
     if interaction.guild is None:
@@ -1265,8 +1264,8 @@ async def debugpoop(interaction: discord.Interaction):
         return
     await post_button_for_guild(interaction.guild.id, int(cfg["channel_id"]))
     await interaction.response.send_message("🧪 Debug: recreated poop button.")
-@bot.tree.command(name="poopstats", description="Show your poop stats for the current year.")
-@app_commands.guild_only()
+@bot.slash_command(name="poopstats", description="Show your poop stats for the current year.")
+@discord.guild_only()
 async def poopstats(interaction: discord.Interaction):
     user_id = interaction.user.id
     year = current_year_local()
@@ -1289,8 +1288,8 @@ async def poopstats(interaction: discord.Interaction):
         f"- Latest poop: **{latest_str}**\n"
         f"- Most poops in one day: **{max_day_str}**"
     )
-@bot.tree.command(name="featurerequest", description="Start a feature request ticket.")
-@app_commands.guild_only()
+@bot.slash_command(name="featurerequest", description="Start a feature request ticket.")
+@discord.guild_only()
 async def featurerequest(interaction: discord.Interaction):
     if interaction.guild is None or interaction.channel is None:
         await interaction.response.send_message(
@@ -1331,10 +1330,10 @@ async def featurerequest(interaction: discord.Interaction):
         f"✅ Created ticket #{ticket_id} in {ticket_target.mention}.",
         ephemeral=True
     )
-@bot.tree.command(name="collab", description="Add a collaborator to the current ticket thread.")
-@app_commands.guild_only()
-@app_commands.describe(user="User to add to the ticket thread.")
-async def collab(interaction: discord.Interaction, user: discord.Member):
+@bot.slash_command(name="collab", description="Add a collaborator to the current ticket thread.")
+@discord.guild_only()
+
+async def collab(interaction: discord.Interaction, user: discord.Option(discord.Member, "User to add to the ticket thread.")):
     if interaction.guild is None:
         await interaction.response.send_message(
             "This command can only be used in a server.",
@@ -1366,8 +1365,8 @@ async def collab(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(
         f"✅ Added {user.mention} to this ticket thread."
     )
-@bot.tree.command(name="closeticket", description="Close the current ticket thread.")
-@app_commands.guild_only()
+@bot.slash_command(name="closeticket", description="Close the current ticket thread.")
+@discord.guild_only()
 async def closeticket(interaction: discord.Interaction):
     if interaction.guild is None:
         return
@@ -1424,10 +1423,10 @@ async def closeticket(interaction: discord.Interaction):
 def is_dev_user(user_id: int) -> bool:
     dev_user_id = get_ticket_dev_user_id()
     return bool(dev_user_id and user_id == dev_user_id)
-@app_commands.guild_only()
-@bot.tree.command(name="gplay", description="Queue and play audio from a YouTube link or search term.")
-@app_commands.describe(youtube_link="A YouTube URL or search text.")
-async def gplay(interaction: discord.Interaction, youtube_link: str):
+@discord.guild_only()
+@bot.slash_command(name="gplay", description="Queue and play audio from a YouTube link or search term.")
+
+async def gplay(interaction: discord.Interaction, youtube_link: discord.Option(str, "A YouTube URL or search text.")):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
@@ -1500,8 +1499,8 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
         ),
         ephemeral=True
     )
-@app_commands.guild_only()
-@bot.tree.command(name="gqueue", description="Show the current playback queue.")
+@discord.guild_only()
+@bot.slash_command(name="gqueue", description="Show the current playback queue.")
 async def gqueue(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -1548,8 +1547,8 @@ async def gqueue(interaction: discord.Interaction):
     else:
         lines.append("\nQueue is empty.")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
-@app_commands.guild_only()
-@bot.tree.command(name="gskip", description="Skip the currently playing track.")
+@discord.guild_only()
+@bot.slash_command(name="gskip", description="Skip the currently playing track.")
 async def gskip(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -1576,8 +1575,8 @@ async def gskip(interaction: discord.Interaction):
         return
     vc.stop()
     await interaction.response.send_message("⏭️ Skipped current track.", ephemeral=True)
-@app_commands.guild_only()
-@bot.tree.command(name="gtranscribe", description="Join your voice channel and start recording speakers for transcription.")
+@discord.guild_only()
+@bot.slash_command(name="gtranscribe", description="Join your voice channel and start recording speakers for transcription.")
 async def gtranscribe(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -1602,21 +1601,33 @@ async def gtranscribe(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
+    await interaction.response.defer(ephemeral=True, thinking=True)
     vc = interaction.guild.voice_client
+    connected_here = False
     if vc is not None and vc.channel != voice_channel:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"I am already connected to {vc.channel.mention}. Disconnect or move me first.",
             ephemeral=True,
         )
         return
     if vc is None or not vc.is_connected():
         try:
-            vc = await voice_channel.connect()
-        except (discord.ClientException, discord.HTTPException):
-            await interaction.response.send_message("I couldn't join your voice channel.", ephemeral=True)
+            vc = await voice_channel.connect(timeout=15.0, reconnect=True)
+            connected_here = True
+        except (discord.ClientException, discord.HTTPException, asyncio.TimeoutError) as exc:
+            print(f"[transcribe] voice connect failed: {type(exc).__name__}: {exc}")
+            await interaction.followup.send(
+                "I couldn't join your voice channel. Confirm I have **Connect/Speak** permissions and that PyNaCl is installed (`pip install -r requirements.txt`).",
+                ephemeral=True,
+            )
             return
+    if vc is None:
+        await interaction.followup.send("I couldn't initialize a voice client.", ephemeral=True)
+        return
+    if getattr(vc, "recording", False):
+        await interaction.followup.send("I am already recording in this server.", ephemeral=True)
+        return
     session = GuildTranscriptionSession(interaction.guild.id, voice_channel.id)
-    transcription_sessions[interaction.guild.id] = session
     def _recording_finished(sink: object, channel: object, *_: object):
         guild = interaction.guild
         if guild is None:
@@ -1625,20 +1636,39 @@ async def gtranscribe(interaction: discord.Interaction):
         if active_session is None:
             return
         copy_recorded_audio_to_session(sink, guild, active_session)
-    sink = discord.sinks.WaveSink()
-    vc.start_recording(
-        sink,
-        _recording_finished,
-        interaction.channel,
-    )
-    await interaction.response.send_message(
+    try:
+        sink = discord.sinks.WaveSink()
+        vc.start_recording(
+            sink,
+            _recording_finished,
+            interaction.channel,
+        )
+    except Exception as exc:
+        print(f"[transcribe] start_recording failed: {type(exc).__name__}: {exc}")
+        shutil.rmtree(session.temp_dir, ignore_errors=True)
+        if connected_here:
+            try:
+                await vc.disconnect(force=True)
+            except (discord.HTTPException, discord.ClientException):
+                pass
+        await interaction.followup.send(
+            f"I joined voice but couldn't start recording: `{type(exc).__name__}`. Ensure Opus/PyNaCl are available on the host.",
+            ephemeral=True,
+        )
+        return
+    transcription_sessions[interaction.guild.id] = session
+    await interaction.followup.send(
         f"🎙️ Started transcription capture in {voice_channel.mention}. Use `/gendsession` when you're done.",
         ephemeral=True,
     )
-@app_commands.guild_only()
-@bot.tree.command(name="gsetuser", description="Set a display alias for a Discord user id in the active transcription session.")
-@app_commands.describe(user="User to alias", name="Alias to write in the transcript")
-async def gsetuser(interaction: discord.Interaction, user: discord.Member, name: str):
+@discord.guild_only()
+@bot.slash_command(name="gsetuser", description="Set a display alias for a Discord user id in the active transcription session.")
+
+async def gsetuser(
+    interaction: discord.Interaction,
+    user: discord.Option(discord.Member, "User to alias"),
+    name: discord.Option(str, "Alias to write in the transcript"),
+):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
@@ -1658,8 +1688,8 @@ async def gsetuser(interaction: discord.Interaction, user: discord.Member, name:
         f"✅ Transcript alias set: `{user.id}` → **{alias}**",
         ephemeral=True,
     )
-@app_commands.guild_only()
-@bot.tree.command(name="gendsession", description="Stop recording and export the transcript text file.")
+@discord.guild_only()
+@bot.slash_command(name="gendsession", description="Stop recording and export the transcript text file.")
 async def gendsession(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -1699,7 +1729,7 @@ async def gendsession(interaction: discord.Interaction):
         ephemeral=True,
     )
     remove_transcription_session(interaction.guild.id)
-@bot.tree.command(name="gokibothelp", description="Show all available GokiBot commands.")
+@bot.slash_command(name="gokibothelp", description="Show all available GokiBot commands.")
 async def gokibothelp(interaction: discord.Interaction):
     command_lines = [
         "**GokiBot Commands**",
@@ -1733,7 +1763,7 @@ async def on_ready():
     init_year_db(current_year_local())
     init_cleanup_db()
     try:
-        await bot.tree.sync()
+        await bot.sync_commands()
     except (discord.HTTPException, discord.Forbidden):
         pass
     if not daily_midnight_pacific.is_running():
