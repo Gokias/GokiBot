@@ -40,3 +40,29 @@ Optional feature variables used by ticketing and alerts:
 - `TICKET_DEV_USER_ID`
 - `TICKET_ARCHIVE_CHANNEL_ID`
 - `WESROTH_CHANNEL_ID`
+
+## Discord bot permissions (for all current features)
+When inviting the bot, grant the following **OAuth2 bot permissions** so every command works as implemented today:
+
+- `View Channels`
+- `Read Message History`
+- `Send Messages`
+- `Send Messages in Threads`
+- `Create Private Threads`
+- `Manage Threads`
+- `Add Reactions`
+- `Manage Messages`
+- `Connect`
+- `Speak`
+
+### Why these are needed
+- Poop logging + consent flows use reactions, reaction removal, and message cleanup.
+- Ticketing + transcription create private threads, add collaborators, and post in thread channels.
+- Ticket archive export reads prior thread history.
+- Music playback and live transcription require voice connection and speaking permissions.
+
+## Discord privileged intent configuration
+Enable **Message Content Intent** in the Discord Developer Portal for this bot. The runtime explicitly sets `intents.message_content = True`.
+
+## Maintenance note
+If new bot features require additional Discord permissions or intents, update this document at the same time as the feature change.
