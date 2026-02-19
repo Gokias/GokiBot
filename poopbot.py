@@ -580,6 +580,19 @@ async def ensure_voice_channel(interaction: discord.Interaction) -> discord.Voic
     if not isinstance(member.voice.channel, discord.VoiceChannel):
         return None
     return member.voice.channel
+
+
+async def wait_for_voice_client_ready(vc: discord.VoiceClient, timeout_seconds: float = 5.0) -> bool:
+    """Wait for the voice websocket handshake to be ready for recording/playback."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not vc.is_connected():
+            return False
+        ws = getattr(vc, "ws", None)
+        if ws and hasattr(ws, "poll_event"):
+            return True
+        await asyncio.sleep(0.1)
+    return False
 async def play_next_track(guild: discord.Guild):
     voice_client = guild.voice_client
     if voice_client is None:
@@ -1647,6 +1660,17 @@ async def gtranscribe(interaction: discord.Interaction):
             return
     if vc is None:
         await interaction.followup.send("I couldn't initialize a voice client.", ephemeral=True)
+        return
+    if not await wait_for_voice_client_ready(vc):
+        if connected_here:
+            try:
+                await vc.disconnect(force=True)
+            except (discord.HTTPException, discord.ClientException):
+                pass
+        await interaction.followup.send(
+            "I connected to voice, but Discord voice wasn't ready in time. Please try `/gtranscribe` again.",
+            ephemeral=True,
+        )
         return
     if getattr(vc, "recording", False):
         await interaction.followup.send("I am already recording in this server.", ephemeral=True)
