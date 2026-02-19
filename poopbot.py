@@ -594,7 +594,7 @@ async def wait_for_voice_client_ready(vc: discord.VoiceClient, timeout_seconds: 
             return True
 
         ws = getattr(vc, "ws", None)
-        if ws is not None:
+        if ws is not None and callable(getattr(ws, "poll_event", None)):
             return True
 
         if getattr(vc, "channel", None) is not None and getattr(vc, "guild", None) is not None:
@@ -612,11 +612,13 @@ def describe_voice_client_state(vc: discord.VoiceClient) -> str:
         connected_event.is_set() if connected_event is not None and hasattr(connected_event, "is_set") else None
     )
     ws = getattr(vc, "ws", None)
+    ws_ready = ws is not None and callable(getattr(ws, "poll_event", None))
     channel = getattr(vc, "channel", None)
     return (
         f"connected={vc.is_connected()} "
         f"event_set={connected_event_set} "
         f"ws={type(ws).__name__ if ws is not None else None} "
+        f"ws_ready={ws_ready} "
         f"channel_id={getattr(channel, 'id', None)}"
     )
 
