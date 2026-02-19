@@ -24,6 +24,13 @@ try:
     from zoneinfo import ZoneInfoNotFoundError
 except ImportError:
     raise RuntimeError("Python 3.9+ required for zoneinfo")
+# Ensure Opus is available for voice/recording on Linux
+try:
+    if not discord.opus.is_loaded():
+        discord.opus.load_opus("libopus.so.0")
+except Exception as e:
+    print(f"[voice] Failed to load Opus: {e}")
+
 # =========================
 # CONFIG
 # =========================
