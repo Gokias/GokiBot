@@ -1437,7 +1437,8 @@ async def gplay(interaction: discord.Interaction, youtube_link: discord.Option(s
             ephemeral=True
         )
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send("Working…", ephemeral=True)
     if interaction.guild.voice_client and interaction.guild.voice_client.channel != voice_channel:
         await interaction.followup.send(
             f"You must be in {interaction.guild.voice_client.channel.mention} to control playback.",
@@ -1682,7 +1683,8 @@ async def gendsession(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send("Working…", ephemeral=True)
     if getattr(vc, "recording", False):
         vc.stop_recording()
         await asyncio.sleep(1)
