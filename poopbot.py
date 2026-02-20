@@ -305,6 +305,8 @@ def current_year_local() -> int:
 intents = discord.Intents.default()
 intents.reactions = True
 intents.message_content = True  # needed for cleanup logging
+intents.voice_states = True  # needed to track voice-channel joins/leaves during transcription
+intents.members = True  # needed to discover/add members to transcript thread and DM consent prompts
 bot = commands.Bot(command_prefix="!", intents=intents)
 # serialize DB writes to avoid sqlite "database is locked"
 db_write_lock = asyncio.Lock()
@@ -498,6 +500,7 @@ async def send_transcription_consent_dm(guild: discord.Guild, member: discord.Me
         f"React with {TRANSCRIBE_CONSENT_EMOJI} in the consent thread message to opt in. "
         "To change your display name, run `/gsetname <display name>` in the server."
     )
+    logger.info("transcribe_consent_dm_sent guild_id=%s user_id=%s", guild.id, member.id)
 
 
 def find_active_transcription_thread(guild: discord.Guild, session: GuildTranscriptionSession) -> discord.Thread | None:
@@ -538,25 +541,39 @@ async def sync_voice_channel_members_for_transcription(
     transcript_thread: discord.Thread,
 ):
     members: list[discord.Member] = []
+    logger.info(
+        "transcribe_sync_members_start guild_id=%s voice_channel_id=%s channel_member_count=%s",
+        guild.id,
+        voice_channel.id,
+        len(getattr(voice_channel, "members", []) or []),
+    )
     for member in voice_channel.members:
         if member.bot:
             continue
         members.append(member)
         try:
             await transcript_thread.add_user(member)
+            logger.info("transcribe_thread_add_user_ok guild_id=%s thread_id=%s user_id=%s", guild.id, transcript_thread.id, member.id)
         except (discord.Forbidden, discord.HTTPException):
-            pass
+            logger.exception("transcribe_thread_add_user_failed guild_id=%s thread_id=%s user_id=%s", guild.id, transcript_thread.id, member.id)
         display_name, _, _ = get_active_transcription_consent(guild.id, member.id)
         if display_name:
             session.consented_user_ids.add(member.id)
             session.aliases_by_user[member.id] = display_name
+            logger.info("transcribe_member_has_active_consent guild_id=%s user_id=%s display_name=%r", guild.id, member.id, display_name)
             continue
         if member.id not in session.dm_prompted_user_ids:
             try:
                 await send_transcription_consent_dm(guild, member)
                 session.dm_prompted_user_ids.add(member.id)
             except (discord.Forbidden, discord.HTTPException):
-                pass
+                logger.exception("transcribe_consent_dm_failed guild_id=%s user_id=%s", guild.id, member.id)
+    logger.info(
+        "transcribe_sync_members_done guild_id=%s discovered_members=%s consented_members=%s",
+        guild.id,
+        [member.id for member in members],
+        sorted(session.consented_user_ids),
+    )
     await prompt_transcription_consent(guild, session, transcript_thread, members)
 
 
@@ -590,17 +607,28 @@ def copy_recorded_audio_slice(sink: object, session: GuildTranscriptionSession) 
         except OSError:
             continue
         copied_files[user_id] = output_file
+    logger.info(
+        "transcribe_slice_copied session_guild_id=%s slice=%s sink_users=%s consented_users=%s copied_users=%s",
+        session.guild_id,
+        session.slice_number,
+        sorted([uid for uid in sink_audio_data.keys() if isinstance(uid, int)]),
+        sorted(session.consented_user_ids),
+        sorted(copied_files.keys()),
+    )
     return copied_files
 
 
 async def post_transcription_slice_lines(guild: discord.Guild, session: GuildTranscriptionSession, copied_files: dict[int, Path]):
     if not copied_files:
+        logger.info("transcribe_slice_skip_empty guild_id=%s slice=%s", guild.id, session.slice_number)
         return
     engine_name, engine = get_whisper_transcriber()
     if engine is None or engine_name is None:
+        logger.warning("transcribe_engine_unavailable guild_id=%s slice=%s", guild.id, session.slice_number)
         return
     thread = find_active_transcription_thread(guild, session)
     if thread is None:
+        logger.warning("transcribe_thread_missing guild_id=%s thread_id=%s", guild.id, session.transcript_thread_id)
         return
     ordered_lines: list[tuple[float, str]] = []
     for user_id, audio_path in copied_files.items():
@@ -615,7 +643,9 @@ async def post_transcription_slice_lines(guild: discord.Guild, session: GuildTra
             ordered_lines.append((start_sec, f"[{stamp}] [{speaker_name}] {phrase}"))
     ordered_lines.sort(key=lambda item: item[0])
     if not ordered_lines:
+        logger.info("transcribe_slice_no_utterances guild_id=%s slice=%s copied_users=%s", guild.id, session.slice_number, sorted(copied_files.keys()))
         return
+    logger.info("transcribe_slice_posting guild_id=%s slice=%s lines=%s", guild.id, session.slice_number, len(ordered_lines))
     for _, line in ordered_lines:
         await thread.send(line)
 
@@ -2069,6 +2099,12 @@ async def gtranscribe(interaction: discord.Interaction):
         )
         return
     await interaction.response.defer(ephemeral=True)
+    logger.info(
+        "transcribe_start_intents guild_id=%s members=%s voice_states=%s",
+        interaction.guild.id,
+        bot.intents.members,
+        bot.intents.voice_states,
+    )
 
     start_label = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
     transcript_thread = await interaction.channel.create_thread(
@@ -2126,6 +2162,13 @@ async def gtranscribe(interaction: discord.Interaction):
     session = GuildTranscriptionSession(interaction.guild.id, voice_channel.id, transcript_thread.id)
     transcription_sessions[interaction.guild.id] = session
     await sync_voice_channel_members_for_transcription(interaction.guild, voice_channel, session, transcript_thread)
+    logger.info(
+        "transcribe_session_initialized guild_id=%s voice_channel_id=%s thread_id=%s consented_users=%s",
+        interaction.guild.id,
+        voice_channel.id,
+        transcript_thread.id,
+        sorted(session.consented_user_ids),
+    )
 
     async def _slice_finished(sink: object, channel: object, *_: object):
         copied = copy_recorded_audio_slice(sink, session)
