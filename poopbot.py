@@ -559,11 +559,10 @@ async def finalize_recording_slice(vc: discord.VoiceClient, guild: discord.Guild
     done_event = asyncio.Event()
     session.active_slice_done = done_event
 
-    def _slice_finished(sink: object, channel: object, *_: object):
+    async def _slice_finished(sink: object, channel: object, *_: object):
         copied = copy_recorded_audio_slice(sink, session)
-        fut = asyncio.run_coroutine_threadsafe(post_transcription_slice_lines(guild, session, copied), bot.loop)
         try:
-            fut.result(timeout=90)
+            await asyncio.wait_for(post_transcription_slice_lines(guild, session, copied), timeout=90)
         except Exception:
             logger.exception("transcribe_slice_post_failed guild_id=%s", guild.id)
         done_event.set()
@@ -2046,11 +2045,10 @@ async def gtranscribe(interaction: discord.Interaction):
             continue
     transcription_sessions[interaction.guild.id] = session
 
-    def _slice_finished(sink: object, channel: object, *_: object):
+    async def _slice_finished(sink: object, channel: object, *_: object):
         copied = copy_recorded_audio_slice(sink, session)
-        fut = asyncio.run_coroutine_threadsafe(post_transcription_slice_lines(interaction.guild, session, copied), bot.loop)
         try:
-            fut.result(timeout=90)
+            await asyncio.wait_for(post_transcription_slice_lines(interaction.guild, session, copied), timeout=90)
         except Exception:
             logger.exception("transcribe_slice_post_failed guild_id=%s", interaction.guild.id)
         session.active_slice_done.set()
