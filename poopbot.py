@@ -734,6 +734,61 @@ async def transcription_live_loop(guild_id: int):
             await finalize_recording_slice(vc, guild, session)
         except asyncio.TimeoutError:
             logger.warning("transcribe_slice_timeout guild_id=%s", guild_id)
+            recovery_session = get_transcription_session(guild_id)
+            recovery_guild = bot.get_guild(guild_id)
+            recovery_vc = recovery_guild.voice_client if recovery_guild is not None else None
+            next_slice = (recovery_session.slice_number + 1) if recovery_session is not None else None
+            try:
+                should_recover = (
+                    recovery_session is not None
+                    and not recovery_session.closed
+                    and recovery_vc is not None
+                    and recovery_vc.is_connected()
+                    and not getattr(recovery_vc, "recording", False)
+                )
+                logger.info(
+                    "transcribe_timeout_recovery_check guild_id=%s next_slice=%s session_open=%s vc_present=%s vc_connected=%s vc_recording=%s",
+                    guild_id,
+                    next_slice,
+                    recovery_session is not None and not recovery_session.closed,
+                    recovery_vc is not None,
+                    recovery_vc.is_connected() if recovery_vc is not None else None,
+                    getattr(recovery_vc, "recording", False) if recovery_vc is not None else None,
+                )
+                if not should_recover:
+                    logger.info("transcribe_timeout_recovery_skipped guild_id=%s next_slice=%s", guild_id, next_slice)
+                    continue
+
+                done_event = asyncio.Event()
+                recovery_session.active_slice_done = done_event
+
+                async def _slice_finished(sink: object, channel: object, *_: object):
+                    logger.info(
+                        "transcribe_timeout_recovery_callback_start guild_id=%s slice=%s sink_type=%s",
+                        recovery_guild.id,
+                        recovery_session.slice_number,
+                        type(sink).__name__,
+                    )
+                    copied = copy_recorded_audio_slice(sink, recovery_session)
+                    try:
+                        await asyncio.wait_for(post_transcription_slice_lines(recovery_guild, recovery_session, copied), timeout=90)
+                    except Exception:
+                        logger.exception("transcribe_slice_post_failed guild_id=%s", recovery_guild.id)
+                    logger.info(
+                        "transcribe_timeout_recovery_callback_done guild_id=%s slice=%s copied_users=%s",
+                        recovery_guild.id,
+                        recovery_session.slice_number,
+                        sorted(copied.keys()),
+                    )
+                    done_event.set()
+
+                logger.info("transcribe_timeout_recovery_start guild_id=%s next_slice=%s", guild_id, next_slice)
+                recovery_sink = discord.sinks.WaveSink()
+                recovery_session.active_sink = recovery_sink
+                recovery_vc.start_recording(recovery_sink, _slice_finished, None)
+                logger.info("transcribe_timeout_recovery_success guild_id=%s next_slice=%s", guild_id, next_slice)
+            except Exception:
+                logger.exception("transcribe_timeout_recovery_failed guild_id=%s next_slice=%s", guild_id, next_slice)
 
 def format_duration(duration_seconds: int) -> str:
     mins, secs = divmod(max(duration_seconds, 0), 60)
