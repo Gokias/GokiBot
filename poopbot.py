@@ -150,6 +150,7 @@ FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
     "Timed out while fetching track info from YouTube. Please try again in a moment."
 )
 TRANSCRIBE_SLICE_SECONDS = max(int(os.getenv("TRANSCRIBE_SLICE_SECONDS", "12")), 5)
+TRANSCRIBE_MAX_FAILURES = max(int(os.getenv("TRANSCRIBE_MAX_FAILURES", "3")), 1)
 TRANSCRIBE_CONSENT_VALID_DAYS = 180
 TRANSCRIBE_CONSENT_EMOJI = "✅"
 # =========================
@@ -338,6 +339,7 @@ class GuildTranscriptionSession:
         self.loop_task: asyncio.Task | None = None
         self.active_sink: object | None = None
         self.active_slice_done = asyncio.Event()
+        self.recording_failure_count = 0
 
 
 transcription_sessions: dict[int, GuildTranscriptionSession] = {}
@@ -702,9 +704,46 @@ async def finalize_recording_slice(vc: discord.VoiceClient, guild: discord.Guild
         new_sink = discord.sinks.WaveSink()
         session.active_sink = new_sink
         vc.start_recording(new_sink, _slice_finished, None)
+        session.recording_failure_count = 0
         logger.info("transcribe_finalize_restart_recording_ok guild_id=%s next_slice=%s", guild.id, session.slice_number + 1)
     except Exception:
-        logger.exception("transcribe_slice_restart_failed guild_id=%s", guild.id)
+        session.recording_failure_count += 1
+        logger.exception(
+            "transcribe_slice_restart_failed guild_id=%s failure_count=%s",
+            guild.id,
+            session.recording_failure_count,
+        )
+        if session.recording_failure_count >= TRANSCRIBE_MAX_FAILURES:
+            await teardown_transcription_session_for_recording_failure(guild, session, "restart_failed")
+
+
+async def teardown_transcription_session_for_recording_failure(
+    guild: discord.Guild | None,
+    session: GuildTranscriptionSession,
+    failure_reason: str,
+):
+    guild_id = session.guild_id
+    session.closed = True
+    if guild is not None:
+        vc = guild.voice_client
+        if vc is not None and vc.is_connected():
+            try:
+                await vc.disconnect(force=True)
+            except (discord.HTTPException, discord.ClientException):
+                logger.exception("transcribe_teardown_disconnect_failed guild_id=%s", guild_id)
+        thread = find_active_transcription_thread(guild, session)
+        if thread is not None:
+            try:
+                await thread.send("🛑 Transcription session ended due to recording failure. Please start `/gtranscribe` again.")
+            except Exception:
+                logger.exception("transcribe_teardown_thread_notify_failed guild_id=%s", guild_id)
+    remove_transcription_session(guild_id)
+    logger.error(
+        "transcribe_recording_failure guild_id=%s failure_count=%s action=torn_down reason=%s",
+        guild_id,
+        session.recording_failure_count,
+        failure_reason,
+    )
 
 
 async def transcription_live_loop(guild_id: int):
@@ -733,9 +772,24 @@ async def transcription_live_loop(guild_id: int):
             logger.info("transcribe_live_loop_finalize guild_id=%s current_slice=%s", guild_id, session.slice_number)
             await finalize_recording_slice(vc, guild, session)
         except asyncio.TimeoutError:
-            logger.warning("transcribe_slice_timeout guild_id=%s", guild_id)
             recovery_session = get_transcription_session(guild_id)
+            if recovery_session is None or recovery_session.closed:
+                logger.warning("transcribe_slice_timeout guild_id=%s failure_count=%s", guild_id, None)
+                continue
+            recovery_session.recording_failure_count += 1
+            logger.warning(
+                "transcribe_slice_timeout guild_id=%s failure_count=%s",
+                guild_id,
+                recovery_session.recording_failure_count,
+            )
             recovery_guild = bot.get_guild(guild_id)
+            if recovery_session.recording_failure_count >= TRANSCRIBE_MAX_FAILURES:
+                await teardown_transcription_session_for_recording_failure(
+                    recovery_guild,
+                    recovery_session,
+                    "finalize_timeout",
+                )
+                continue
             recovery_vc = recovery_guild.voice_client if recovery_guild is not None else None
             next_slice = (recovery_session.slice_number + 1) if recovery_session is not None else None
             try:
@@ -786,9 +840,22 @@ async def transcription_live_loop(guild_id: int):
                 recovery_sink = discord.sinks.WaveSink()
                 recovery_session.active_sink = recovery_sink
                 recovery_vc.start_recording(recovery_sink, _slice_finished, None)
+                recovery_session.recording_failure_count = 0
                 logger.info("transcribe_timeout_recovery_success guild_id=%s next_slice=%s", guild_id, next_slice)
             except Exception:
-                logger.exception("transcribe_timeout_recovery_failed guild_id=%s next_slice=%s", guild_id, next_slice)
+                recovery_session.recording_failure_count += 1
+                logger.exception(
+                    "transcribe_timeout_recovery_failed guild_id=%s next_slice=%s failure_count=%s",
+                    guild_id,
+                    next_slice,
+                    recovery_session.recording_failure_count,
+                )
+                if recovery_session.recording_failure_count >= TRANSCRIBE_MAX_FAILURES:
+                    await teardown_transcription_session_for_recording_failure(
+                        recovery_guild,
+                        recovery_session,
+                        "timeout_recovery_restart_failed",
+                    )
 
 def format_duration(duration_seconds: int) -> str:
     mins, secs = divmod(max(duration_seconds, 0), 60)
