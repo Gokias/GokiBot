@@ -340,6 +340,8 @@ class GuildTranscriptionSession:
         self.active_sink: object | None = None
         self.active_slice_done = asyncio.Event()
         self.recording_failure_count = 0
+        self.engine_name: str | None = None
+        self.engine_instance: object | None = None
 
 
 transcription_sessions: dict[int, GuildTranscriptionSession] = {}
@@ -363,6 +365,8 @@ def remove_transcription_session(guild_id: int):
     ]
     for message_id in stale_prompt_ids:
         transcription_consent_prompts.pop(message_id, None)
+    session.engine_name = None
+    session.engine_instance = None
     shutil.rmtree(session.temp_dir, ignore_errors=True)
 def resolve_display_name(guild: discord.Guild | None, user_id: int, aliases_by_user: dict[int, str]) -> str:
     alias = aliases_by_user.get(user_id)
@@ -688,7 +692,8 @@ async def post_transcription_slice_lines(guild: discord.Guild, session: GuildTra
     if not copied_files:
         logger.info("transcribe_slice_skip_empty guild_id=%s slice=%s", guild.id, session.slice_number)
         return
-    engine_name, engine = get_whisper_transcriber()
+    engine_name = session.engine_name
+    engine = session.engine_instance
     if engine is None or engine_name is None:
         logger.warning("transcribe_engine_unavailable guild_id=%s slice=%s", guild.id, session.slice_number)
         return
@@ -697,6 +702,7 @@ async def post_transcription_slice_lines(guild: discord.Guild, session: GuildTra
         logger.warning("transcribe_thread_missing guild_id=%s thread_id=%s", guild.id, session.transcript_thread_id)
         return
     ordered_lines: list[tuple[float, str]] = []
+    transcribe_started = time.monotonic()
     for user_id, audio_path in copied_files.items():
         speaker_name = resolve_display_name(guild, user_id, session.aliases_by_user)
         utterances = transcribe_audio_file(engine_name, engine, audio_path)
@@ -707,6 +713,13 @@ async def post_transcription_slice_lines(guild: discord.Guild, session: GuildTra
             start_sec = float(utterance.get("start") or 0.0)
             stamp = slice_timestamp_label(session.started_at, ((session.slice_number - 1) * TRANSCRIBE_SLICE_SECONDS) + start_sec)
             ordered_lines.append((start_sec, f"[{stamp}] [{speaker_name}] {phrase}"))
+    logger.info(
+        "transcribe_slice_transcription_done guild_id=%s slice=%s duration_ms=%.2f copied_users=%s",
+        guild.id,
+        session.slice_number,
+        (time.monotonic() - transcribe_started) * 1000,
+        sorted(copied_files.keys()),
+    )
     ordered_lines.sort(key=lambda item: item[0])
     if not ordered_lines:
         logger.info("transcribe_slice_no_utterances guild_id=%s slice=%s copied_users=%s", guild.id, session.slice_number, sorted(copied_files.keys()))
@@ -2351,6 +2364,20 @@ async def gtranscribe(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
+    engine_init_started = time.monotonic()
+    engine_name, engine_instance = get_whisper_transcriber()
+    if engine_name is None or engine_instance is None:
+        await interaction.response.send_message(
+            "Whisper transcription engine is unavailable. Install one of: `pip install faster-whisper` (recommended) or `pip install openai-whisper`, then retry `/gtranscribe`.",
+            ephemeral=True,
+        )
+        return
+    logger.info(
+        "transcribe_engine_initialized guild_id=%s engine=%s duration_ms=%.2f",
+        interaction.guild.id,
+        engine_name,
+        (time.monotonic() - engine_init_started) * 1000,
+    )
     await interaction.response.defer(ephemeral=True)
     logger.info(
         "transcribe_start_intents guild_id=%s members=%s voice_states=%s",
@@ -2413,6 +2440,8 @@ async def gtranscribe(interaction: discord.Interaction):
         return
 
     session = GuildTranscriptionSession(interaction.guild.id, voice_channel.id, transcript_thread.id)
+    session.engine_name = engine_name
+    session.engine_instance = engine_instance
     transcription_sessions[interaction.guild.id] = session
     await sync_voice_channel_members_for_transcription(interaction.guild, voice_channel, session, transcript_thread)
     logger.info(
