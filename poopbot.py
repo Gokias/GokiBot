@@ -13,6 +13,8 @@ import json
 import tempfile
 import shutil
 import importlib.util
+import io
+import wave
 import ctypes.util
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -334,14 +336,24 @@ class GuildTranscriptionSession:
         self.aliases_by_user: dict[int, str] = {}
         self.consented_user_ids: set[int] = set()
         self.prompted_user_ids: set[int] = set()
-        self.slice_number = 0
         self.closed = False
         self.loop_task: asyncio.Task | None = None
+        self.worker_task: asyncio.Task | None = None
         self.active_sink: object | None = None
-        self.active_slice_done = asyncio.Event()
+        self.capture_done = asyncio.Event()
         self.recording_failure_count = 0
         self.engine_name: str | None = None
         self.engine_instance: object | None = None
+        self.capture_index = 0
+        self.chunk_index = 0
+        self.chunk_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=128)
+        self.chunk_meta: list[dict[str, object]] = []
+        self.chunk_meta_by_id: dict[int, dict[str, object]] = {}
+        self.chunk_transcripts: dict[int, list[dict[str, object]]] = {}
+        self.pending_live_lines: list[str] = []
+        self.user_last_frame: dict[int, int] = {}
+        self.chunk_meta_path = self.temp_dir / "chunk_metadata.jsonl"
+        self.finalized = False
 
 
 transcription_sessions: dict[int, GuildTranscriptionSession] = {}
@@ -367,7 +379,8 @@ def remove_transcription_session(guild_id: int):
         transcription_consent_prompts.pop(message_id, None)
     session.engine_name = None
     session.engine_instance = None
-    shutil.rmtree(session.temp_dir, ignore_errors=True)
+    if session.finalized:
+        shutil.rmtree(session.temp_dir, ignore_errors=True)
 def resolve_display_name(guild: discord.Guild | None, user_id: int, aliases_by_user: dict[int, str]) -> str:
     alias = aliases_by_user.get(user_id)
     if alias:
@@ -652,146 +665,238 @@ def slice_timestamp_label(started_at: datetime, seconds_offset: float) -> str:
     return ts.astimezone(LOCAL_TZ).strftime("%H:%M:%S")
 
 
-def copy_recorded_audio_slice(sink: object, session: GuildTranscriptionSession) -> dict[int, Path]:
-    copied_files: dict[int, Path] = {}
+def persist_chunk_metadata(session: GuildTranscriptionSession, chunk: dict[str, object]) -> None:
+    with session.chunk_meta_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+
+
+def capture_chunk_from_sink_audio(
+    session: GuildTranscriptionSession,
+    user_id: int,
+    audio_obj: object,
+    capture_dir: Path,
+    capture_offset_seconds: float,
+) -> dict[str, object] | None:
+    file_obj = getattr(audio_obj, "file", None)
+    if file_obj is None:
+        return None
+    try:
+        prev_pos = file_obj.tell() if hasattr(file_obj, "tell") else None
+        if hasattr(file_obj, "seek"):
+            file_obj.seek(0)
+        payload = file_obj.read() if hasattr(file_obj, "read") else None
+        if prev_pos is not None and hasattr(file_obj, "seek"):
+            file_obj.seek(prev_pos)
+    except Exception:
+        return None
+    if not isinstance(payload, (bytes, bytearray)):
+        return None
+    try:
+        wav_in = wave.open(io.BytesIO(payload), "rb")
+    except wave.Error:
+        return None
+    with wav_in:
+        framerate = wav_in.getframerate() or 1
+        total_frames = wav_in.getnframes()
+        last_frame = session.user_last_frame.get(user_id, 0)
+        if total_frames <= last_frame:
+            return None
+        wav_in.setpos(last_frame)
+        delta_frames = total_frames - last_frame
+        frames = wav_in.readframes(delta_frames)
+        params = wav_in.getparams()
+    session.user_last_frame[user_id] = total_frames
+    chunk_start = capture_offset_seconds + (last_frame / max(framerate, 1))
+    session.chunk_index += 1
+    chunk_file = capture_dir / f"chunk_{session.chunk_index:06d}_u{user_id}.wav"
+    with wave.open(str(chunk_file), "wb") as wav_out:
+        wav_out.setparams(params)
+        wav_out.writeframes(frames)
+    chunk = {
+        "chunk_id": session.chunk_index,
+        "user_id": user_id,
+        "start_offset": round(chunk_start, 3),
+        "file_path": str(chunk_file),
+        "queued": False,
+        "transcribed": False,
+    }
+    session.chunk_meta.append(chunk)
+    session.chunk_meta_by_id[session.chunk_index] = chunk
+    persist_chunk_metadata(session, chunk)
+    return chunk
+
+
+async def flush_active_recording_buffers(session: GuildTranscriptionSession, guild_id: int) -> int:
+    sink = session.active_sink
     sink_audio_data = getattr(sink, "audio_data", None)
     if not isinstance(sink_audio_data, dict):
-        return copied_files
-    session.slice_number += 1
-    slice_dir = session.temp_dir / f"slice_{session.slice_number:05d}"
-    slice_dir.mkdir(parents=True, exist_ok=True)
+        return 0
+    session.capture_index += 1
+    capture_dir = session.temp_dir / f"capture_{session.capture_index:05d}"
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    capture_offset_seconds = (datetime.now(timezone.utc) - session.started_at).total_seconds()
+    produced = 0
     for user_id, audio_obj in sink_audio_data.items():
         if not isinstance(user_id, int) or user_id not in session.consented_user_ids:
             continue
-        file_path = getattr(audio_obj, "file", None)
-        if file_path is None:
+        chunk = capture_chunk_from_sink_audio(session, user_id, audio_obj, capture_dir, capture_offset_seconds)
+        if chunk is None:
             continue
-        output_file = slice_dir / f"{user_id}.wav"
+        produced += 1
         try:
-            if hasattr(file_path, "seek"):
-                file_path.seek(0)
-            if hasattr(file_path, "read"):
-                output_file.write_bytes(file_path.read())
-            else:
-                shutil.copy(str(file_path), output_file)
-        except OSError:
-            continue
-        copied_files[user_id] = output_file
+            session.chunk_queue.put_nowait(int(chunk["chunk_id"]))
+            chunk["queued"] = True
+        except asyncio.QueueFull:
+            logger.warning("transcribe_queue_backpressure guild_id=%s chunk_id=%s", guild_id, chunk["chunk_id"])
     logger.info(
-        "transcribe_slice_copied session_guild_id=%s slice=%s sink_users=%s consented_users=%s copied_users=%s",
-        session.guild_id,
-        session.slice_number,
-        sorted([uid for uid in sink_audio_data.keys() if isinstance(uid, int)]),
-        sorted(session.consented_user_ids),
-        sorted(copied_files.keys()),
+        "transcribe_capture_flushed guild_id=%s capture=%s produced_chunks=%s queue_size=%s",
+        guild_id,
+        session.capture_index,
+        produced,
+        session.chunk_queue.qsize(),
     )
-    return copied_files
+    return produced
 
 
-async def post_transcription_slice_lines(guild: discord.Guild, session: GuildTranscriptionSession, copied_files: dict[int, Path]):
-    if not copied_files:
-        logger.info("transcribe_slice_skip_empty guild_id=%s slice=%s", guild.id, session.slice_number)
-        return
-    engine_name = session.engine_name
-    engine = session.engine_instance
-    if engine is None or engine_name is None:
-        logger.warning("transcribe_engine_unavailable guild_id=%s slice=%s", guild.id, session.slice_number)
-        return
+def build_transcript_lines_for_chunk(
+    guild: discord.Guild | None,
+    session: GuildTranscriptionSession,
+    chunk: dict[str, object],
+    utterances: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    user_id = int(chunk["user_id"])
+    speaker_name = resolve_display_name(guild, user_id, session.aliases_by_user)
+    base_offset = float(chunk["start_offset"])
+    lines: list[dict[str, object]] = []
+    for utterance in utterances:
+        phrase = str(utterance.get("text") or "").strip()
+        if not phrase:
+            continue
+        rel_start = float(utterance.get("start") or 0.0)
+        absolute_start = base_offset + rel_start
+        stamp = slice_timestamp_label(session.started_at, absolute_start)
+        lines.append({
+            "absolute_start": absolute_start,
+            "line": f"[{stamp}] [{speaker_name}] {phrase}",
+        })
+    lines.sort(key=lambda item: item["absolute_start"])
+    return lines
+
+
+async def try_post_live_lines(guild: discord.Guild | None, session: GuildTranscriptionSession, lines: list[str]) -> bool:
+    if not lines:
+        return True
+    if guild is None:
+        session.pending_live_lines.extend(lines)
+        return False
     thread = find_active_transcription_thread(guild, session)
     if thread is None:
-        logger.warning("transcribe_thread_missing guild_id=%s thread_id=%s", guild.id, session.transcript_thread_id)
-        return
-    ordered_lines: list[tuple[float, str]] = []
-    transcribe_started = time.monotonic()
-    for user_id, audio_path in copied_files.items():
-        speaker_name = resolve_display_name(guild, user_id, session.aliases_by_user)
-        utterances = transcribe_audio_file(engine_name, engine, audio_path)
-        for utterance in utterances:
-            phrase = str(utterance.get("text") or "").strip()
-            if not phrase:
-                continue
-            start_sec = float(utterance.get("start") or 0.0)
-            stamp = slice_timestamp_label(session.started_at, ((session.slice_number - 1) * TRANSCRIBE_SLICE_SECONDS) + start_sec)
-            ordered_lines.append((start_sec, f"[{stamp}] [{speaker_name}] {phrase}"))
-    logger.info(
-        "transcribe_slice_transcription_done guild_id=%s slice=%s duration_ms=%.2f copied_users=%s",
-        guild.id,
-        session.slice_number,
-        (time.monotonic() - transcribe_started) * 1000,
-        sorted(copied_files.keys()),
-    )
-    ordered_lines.sort(key=lambda item: item[0])
-    if not ordered_lines:
-        logger.info("transcribe_slice_no_utterances guild_id=%s slice=%s copied_users=%s", guild.id, session.slice_number, sorted(copied_files.keys()))
-        return
-    logger.info("transcribe_slice_posting guild_id=%s slice=%s lines=%s", guild.id, session.slice_number, len(ordered_lines))
-    for _, line in ordered_lines:
-        await thread.send(line)
+        session.pending_live_lines.extend(lines)
+        return False
+    try:
+        for line in lines:
+            await thread.send(line)
+        return True
+    except Exception:
+        logger.exception("transcribe_live_post_failed guild_id=%s", session.guild_id)
+        session.pending_live_lines.extend(lines)
+        return False
 
 
-async def finalize_recording_slice(vc: discord.VoiceClient, guild: discord.Guild, session: GuildTranscriptionSession):
-    if not getattr(vc, "recording", False):
-        logger.warning(
-            "transcribe_finalize_skipped_not_recording guild_id=%s voice_connected=%s",
-            guild.id,
-            vc.is_connected() if vc is not None else None,
-        )
-        return
-    logger.info(
-        "transcribe_finalize_start guild_id=%s slice=%s voice_connected=%s",
-        guild.id,
-        session.slice_number,
-        vc.is_connected(),
-    )
-    done_event = asyncio.Event()
-    session.active_slice_done = done_event
-
-    async def _slice_finished(sink: object, channel: object, *_: object):
-        logger.info(
-            "transcribe_finalize_callback_start guild_id=%s slice=%s sink_type=%s",
-            guild.id,
-            session.slice_number,
-            type(sink).__name__,
-        )
-        copied = copy_recorded_audio_slice(sink, session)
+async def transcription_worker_loop(guild_id: int):
+    logger.info("transcribe_worker_started guild_id=%s", guild_id)
+    while True:
+        session = get_transcription_session(guild_id)
+        if session is None:
+            logger.info("transcribe_worker_exit guild_id=%s reason=session_missing", guild_id)
+            return
+        if session.closed and session.chunk_queue.empty():
+            logger.info("transcribe_worker_exit guild_id=%s reason=session_closed", guild_id)
+            return
         try:
-            await asyncio.wait_for(post_transcription_slice_lines(guild, session, copied), timeout=90)
+            chunk_id = await asyncio.wait_for(session.chunk_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+        chunk = session.chunk_meta_by_id.get(chunk_id)
+        if chunk is None or chunk.get("transcribed"):
+            session.chunk_queue.task_done()
+            continue
+        engine_name = session.engine_name
+        engine = session.engine_instance
+        if engine_name is None or engine is None:
+            session.chunk_queue.task_done()
+            continue
+        try:
+            utterances = transcribe_audio_file(engine_name, engine, Path(str(chunk["file_path"])))
+            lines = build_transcript_lines_for_chunk(bot.get_guild(guild_id), session, chunk, utterances)
+            session.chunk_transcripts[chunk_id] = lines
+            chunk["transcribed"] = True
+            await try_post_live_lines(bot.get_guild(guild_id), session, [item["line"] for item in lines])
         except Exception:
-            logger.exception("transcribe_slice_post_failed guild_id=%s", guild.id)
-        logger.info(
-            "transcribe_finalize_callback_done guild_id=%s slice=%s copied_users=%s",
-            guild.id,
-            session.slice_number,
-            sorted(copied.keys()),
-        )
-        done_event.set()
+            logger.exception("transcribe_chunk_failed guild_id=%s chunk_id=%s", guild_id, chunk_id)
+        finally:
+            session.chunk_queue.task_done()
 
-    try:
-        vc.stop_recording()
-        logger.info("transcribe_finalize_stop_recording_called guild_id=%s slice=%s", guild.id, session.slice_number)
-    except Exception:
-        logger.exception("transcribe_slice_stop_failed guild_id=%s", guild.id)
-        done_event.set()
-    await asyncio.wait_for(done_event.wait(), timeout=120)
-    logger.info("transcribe_finalize_done_event_received guild_id=%s slice=%s", guild.id, session.slice_number)
-    if session.closed:
-        logger.info("transcribe_finalize_exit_session_closed guild_id=%s slice=%s", guild.id, session.slice_number)
-        return
-    try:
-        new_sink = discord.sinks.WaveSink()
-        session.active_sink = new_sink
-        vc.start_recording(new_sink, _slice_finished, None)
-        session.recording_failure_count = 0
-        logger.info("transcribe_finalize_restart_recording_ok guild_id=%s next_slice=%s", guild.id, session.slice_number + 1)
-    except Exception:
-        session.recording_failure_count += 1
-        logger.exception(
-            "transcribe_slice_restart_failed guild_id=%s failure_count=%s",
-            guild.id,
-            session.recording_failure_count,
-        )
-        if session.recording_failure_count >= TRANSCRIBE_MAX_FAILURES:
-            await teardown_transcription_session_for_recording_failure(guild, session, "restart_failed")
+
+async def transcription_live_loop(guild_id: int):
+    logger.info("transcribe_live_loop_started guild_id=%s interval_seconds=%s", guild_id, TRANSCRIBE_SLICE_SECONDS)
+    while True:
+        await asyncio.sleep(TRANSCRIBE_SLICE_SECONDS)
+        session = get_transcription_session(guild_id)
+        if session is None or session.closed:
+            logger.info("transcribe_live_loop_exit guild_id=%s", guild_id)
+            return
+        guild = bot.get_guild(guild_id)
+        vc = guild.voice_client if guild is not None else None
+        if vc is None or not vc.is_connected() or not getattr(vc, "recording", False):
+            continue
+        await flush_active_recording_buffers(session, guild_id)
+        if session.pending_live_lines:
+            pending = list(session.pending_live_lines)
+            session.pending_live_lines.clear()
+            await try_post_live_lines(guild, session, pending)
+
+
+async def finalize_transcription_session(guild: discord.Guild, session: GuildTranscriptionSession, vc: discord.VoiceClient | None) -> Path:
+    session.closed = True
+    if vc is not None and vc.is_connected() and getattr(vc, "recording", False):
+        try:
+            vc.stop_recording()
+        except Exception:
+            logger.exception("transcribe_stop_recording_failed guild_id=%s", guild.id)
+    await asyncio.wait_for(session.capture_done.wait(), timeout=60)
+    await flush_active_recording_buffers(session, guild.id)
+    if not session.chunk_queue.empty():
+        await session.chunk_queue.join()
+
+    engine_name = session.engine_name
+    engine = session.engine_instance
+    if engine_name is not None and engine is not None:
+        for chunk in session.chunk_meta:
+            if chunk.get("transcribed"):
+                continue
+            try:
+                utterances = transcribe_audio_file(engine_name, engine, Path(str(chunk["file_path"])))
+                lines = build_transcript_lines_for_chunk(guild, session, chunk, utterances)
+                session.chunk_transcripts[int(chunk["chunk_id"])] = lines
+                chunk["transcribed"] = True
+            except Exception:
+                logger.exception("transcribe_final_pass_failed guild_id=%s chunk_id=%s", guild.id, chunk.get("chunk_id"))
+
+    all_lines: list[dict[str, object]] = []
+    for chunk in session.chunk_meta:
+        all_lines.extend(session.chunk_transcripts.get(int(chunk["chunk_id"]), []))
+    all_lines.sort(key=lambda item: float(item.get("absolute_start", 0.0)))
+    transcript_file = session.temp_dir / "final_transcript.txt"
+    transcript_text = "\n".join(item["line"] for item in all_lines) if all_lines else "(no transcribed speech)"
+    transcript_file.write_text(transcript_text, encoding="utf-8")
+
+    thread = find_active_transcription_thread(guild, session)
+    if thread is not None:
+        await thread.send("✅ Final transcript complete.", file=discord.File(str(transcript_file), filename="final_transcript.txt"))
+
+    session.finalized = True
+    return transcript_file
 
 
 async def teardown_transcription_session_for_recording_failure(
@@ -822,117 +927,6 @@ async def teardown_transcription_session_for_recording_failure(
         failure_reason,
     )
 
-
-async def transcription_live_loop(guild_id: int):
-    logger.info("transcribe_live_loop_started guild_id=%s interval_seconds=%s", guild_id, TRANSCRIBE_SLICE_SECONDS)
-    while True:
-        await asyncio.sleep(TRANSCRIBE_SLICE_SECONDS)
-        session = get_transcription_session(guild_id)
-        if session is None or session.closed:
-            logger.info("transcribe_live_loop_exit guild_id=%s reason=%s", guild_id, "session_missing" if session is None else "session_closed")
-            return
-        guild = bot.get_guild(guild_id)
-        if guild is None:
-            logger.warning("transcribe_live_loop_skip guild_id=%s reason=guild_not_found", guild_id)
-            continue
-        vc = guild.voice_client
-        if vc is None or not vc.is_connected() or not getattr(vc, "recording", False):
-            logger.warning(
-                "transcribe_live_loop_skip guild_id=%s reason=voice_not_recording vc_present=%s vc_connected=%s vc_recording=%s",
-                guild_id,
-                vc is not None,
-                vc.is_connected() if vc is not None else None,
-                getattr(vc, "recording", False) if vc is not None else None,
-            )
-            continue
-        try:
-            logger.info("transcribe_live_loop_finalize guild_id=%s current_slice=%s", guild_id, session.slice_number)
-            await finalize_recording_slice(vc, guild, session)
-        except asyncio.TimeoutError:
-            recovery_session = get_transcription_session(guild_id)
-            if recovery_session is None or recovery_session.closed:
-                logger.warning("transcribe_slice_timeout guild_id=%s failure_count=%s", guild_id, None)
-                continue
-            recovery_session.recording_failure_count += 1
-            logger.warning(
-                "transcribe_slice_timeout guild_id=%s failure_count=%s",
-                guild_id,
-                recovery_session.recording_failure_count,
-            )
-            recovery_guild = bot.get_guild(guild_id)
-            if recovery_session.recording_failure_count >= TRANSCRIBE_MAX_FAILURES:
-                await teardown_transcription_session_for_recording_failure(
-                    recovery_guild,
-                    recovery_session,
-                    "finalize_timeout",
-                )
-                continue
-            recovery_vc = recovery_guild.voice_client if recovery_guild is not None else None
-            next_slice = (recovery_session.slice_number + 1) if recovery_session is not None else None
-            try:
-                should_recover = (
-                    recovery_session is not None
-                    and not recovery_session.closed
-                    and recovery_vc is not None
-                    and recovery_vc.is_connected()
-                    and not getattr(recovery_vc, "recording", False)
-                )
-                logger.info(
-                    "transcribe_timeout_recovery_check guild_id=%s next_slice=%s session_open=%s vc_present=%s vc_connected=%s vc_recording=%s",
-                    guild_id,
-                    next_slice,
-                    recovery_session is not None and not recovery_session.closed,
-                    recovery_vc is not None,
-                    recovery_vc.is_connected() if recovery_vc is not None else None,
-                    getattr(recovery_vc, "recording", False) if recovery_vc is not None else None,
-                )
-                if not should_recover:
-                    logger.info("transcribe_timeout_recovery_skipped guild_id=%s next_slice=%s", guild_id, next_slice)
-                    continue
-
-                done_event = asyncio.Event()
-                recovery_session.active_slice_done = done_event
-
-                async def _slice_finished(sink: object, channel: object, *_: object):
-                    logger.info(
-                        "transcribe_timeout_recovery_callback_start guild_id=%s slice=%s sink_type=%s",
-                        recovery_guild.id,
-                        recovery_session.slice_number,
-                        type(sink).__name__,
-                    )
-                    copied = copy_recorded_audio_slice(sink, recovery_session)
-                    try:
-                        await asyncio.wait_for(post_transcription_slice_lines(recovery_guild, recovery_session, copied), timeout=90)
-                    except Exception:
-                        logger.exception("transcribe_slice_post_failed guild_id=%s", recovery_guild.id)
-                    logger.info(
-                        "transcribe_timeout_recovery_callback_done guild_id=%s slice=%s copied_users=%s",
-                        recovery_guild.id,
-                        recovery_session.slice_number,
-                        sorted(copied.keys()),
-                    )
-                    done_event.set()
-
-                logger.info("transcribe_timeout_recovery_start guild_id=%s next_slice=%s", guild_id, next_slice)
-                recovery_sink = discord.sinks.WaveSink()
-                recovery_session.active_sink = recovery_sink
-                recovery_vc.start_recording(recovery_sink, _slice_finished, None)
-                recovery_session.recording_failure_count = 0
-                logger.info("transcribe_timeout_recovery_success guild_id=%s next_slice=%s", guild_id, next_slice)
-            except Exception:
-                recovery_session.recording_failure_count += 1
-                logger.exception(
-                    "transcribe_timeout_recovery_failed guild_id=%s next_slice=%s failure_count=%s",
-                    guild_id,
-                    next_slice,
-                    recovery_session.recording_failure_count,
-                )
-                if recovery_session.recording_failure_count >= TRANSCRIBE_MAX_FAILURES:
-                    await teardown_transcription_session_for_recording_failure(
-                        recovery_guild,
-                        recovery_session,
-                        "timeout_recovery_restart_failed",
-                    )
 
 def format_duration(duration_seconds: int) -> str:
     mins, secs = divmod(max(duration_seconds, 0), 60)
@@ -1186,7 +1180,7 @@ def describe_transcription_session_state(session: GuildTranscriptionSession | No
         return "session=none"
     return (
         f"temp_dir={session.temp_dir} "
-        f"slice={session.slice_number} "
+        f"captures={session.capture_index} "
         f"consented={len(session.consented_user_ids)} "
         f"thread_id={session.transcript_thread_id}"
     )
@@ -2338,7 +2332,7 @@ async def gskip(interaction: discord.Interaction):
     vc.stop()
     await interaction.response.send_message("⏭️ Skipped current track.", ephemeral=True)
 @discord.guild_only()
-@bot.slash_command(name="gtranscribe", description="Join your voice channel and start live transcription in a transcript thread.")
+@bot.slash_command(name="gtranscribe", description="Capture voice now, with deferred transcription and guaranteed final transcript at session end.")
 async def gtranscribe(interaction: discord.Interaction):
     logger.info("transcribe_command_start context=%r", build_interaction_log_context(interaction, vc=getattr(getattr(interaction, "guild", None), "voice_client", None)))
     if interaction.guild is None or interaction.channel is None:
@@ -2452,30 +2446,18 @@ async def gtranscribe(interaction: discord.Interaction):
         sorted(session.consented_user_ids),
     )
 
-    async def _slice_finished(sink: object, channel: object, *_: object):
+    async def _capture_finished(sink: object, channel: object, *_: object):
         logger.info(
-            "transcribe_initial_callback_start guild_id=%s slice=%s sink_type=%s",
+            "transcribe_capture_callback_start guild_id=%s sink_type=%s",
             interaction.guild.id,
-            session.slice_number,
             type(sink).__name__,
         )
-        copied = copy_recorded_audio_slice(sink, session)
-        try:
-            await asyncio.wait_for(post_transcription_slice_lines(interaction.guild, session, copied), timeout=90)
-        except Exception:
-            logger.exception("transcribe_slice_post_failed guild_id=%s", interaction.guild.id)
-        logger.info(
-            "transcribe_initial_callback_done guild_id=%s slice=%s copied_users=%s",
-            interaction.guild.id,
-            session.slice_number,
-            sorted(copied.keys()),
-        )
-        session.active_slice_done.set()
+        session.capture_done.set()
 
     try:
         sink = discord.sinks.WaveSink()
         session.active_sink = sink
-        vc.start_recording(sink, _slice_finished, None)
+        vc.start_recording(sink, _capture_finished, None)
         logger.info(
             "transcribe_start_recording_ok guild_id=%s voice_channel_id=%s thread_id=%s",
             interaction.guild.id,
@@ -2497,8 +2479,9 @@ async def gtranscribe(interaction: discord.Interaction):
         return
 
     session.loop_task = asyncio.create_task(transcription_live_loop(interaction.guild.id))
+    session.worker_task = asyncio.create_task(transcription_worker_loop(interaction.guild.id))
     await interaction.followup.send(
-        f"🎙️ Live transcription started in {voice_channel.mention}. Updates will be posted in {transcript_thread.mention}.",
+        f"🎙️ Transcription capture started in {voice_channel.mention}. Live posts may lag; a complete transcript is guaranteed when `/gendsession` is used.",
         ephemeral=True,
     )
 
@@ -2528,7 +2511,7 @@ async def gsetname(
 
 
 @discord.guild_only()
-@bot.slash_command(name="gendsession", description="Stop live transcription and disconnect from voice.")
+@bot.slash_command(name="gendsession", description="Stop capture, finalize deferred transcription, and disconnect from voice.")
 async def gendsession(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -2542,24 +2525,21 @@ async def gendsession(interaction: discord.Interaction):
         return
     vc = interaction.guild.voice_client
     await interaction.response.defer(ephemeral=True)
-    if vc is not None and vc.is_connected() and getattr(vc, "recording", False):
-        try:
-            session.closed = True
-            await finalize_recording_slice(vc, interaction.guild, session)
-        except asyncio.TimeoutError:
-            logger.warning("transcribe_final_slice_timeout guild_id=%s", interaction.guild.id)
+    try:
+        await finalize_transcription_session(interaction.guild, session, vc)
+    except asyncio.TimeoutError:
+        logger.warning("transcribe_finalization_timeout guild_id=%s", interaction.guild.id)
     if session.loop_task is not None:
         session.loop_task.cancel()
+    if session.worker_task is not None:
+        session.worker_task.cancel()
     if vc is not None and vc.is_connected():
         try:
             await vc.disconnect(force=True)
         except (discord.HTTPException, discord.ClientException):
             pass
-    thread = interaction.guild.get_thread(session.transcript_thread_id)
-    if thread is not None:
-        await thread.send("🛑 Transcription session ended. Bot disconnected from voice.")
     remove_transcription_session(interaction.guild.id)
-    await interaction.followup.send("✅ Transcription session ended and bot disconnected.", ephemeral=True)
+    await interaction.followup.send("✅ Transcription capture ended. Final transcript generated.", ephemeral=True)
 
 
 @bot.slash_command(name="gokibothelp", description="Show all available GokiBot commands.")
@@ -2572,9 +2552,9 @@ async def gokibothelp(interaction: discord.Interaction):
         "- `/gplay <youtube_link_or_search>` — Queue and play YouTube audio.",
         "- `/gqueue` — Show the current playback queue.",
         "- `/gskip` — Skip the currently playing track.",
-        "- `/gtranscribe` — Start live transcription in a timestamped transcript thread.",
+        "- `/gtranscribe` — Start durable voice capture (live transcript posts may lag).",
         "- `/gsetname <name>` — Set your transcript display name",
-        "- `/gendsession` — Stop live transcription and disconnect.",
+        "- `/gendsession` — Stop capture, finalize, and post the complete transcript.",
         "- `/gokibothelp` — Show this help message."
     ]
     if is_dev_user(interaction.user.id):
