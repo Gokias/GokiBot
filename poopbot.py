@@ -495,6 +495,39 @@ async def upsert_transcription_consent(guild_id: int, user_id: int, display_name
             )
 
 
+def has_transcription_consent_prompt_been_sent(guild_id: int, user_id: int) -> bool:
+    with db_config() as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM transcription_consent_prompts_sent
+            WHERE guild_id=? AND user_id=?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+    return row is not None
+
+
+async def mark_transcription_consent_prompt_sent(guild_id: int, user_id: int):
+    now_utc = datetime.now(timezone.utc)
+    async with db_write_lock:
+        with db_config() as conn:
+            conn.execute(
+                """
+                INSERT INTO transcription_consent_prompts_sent(
+                    guild_id, user_id, prompted_at_utc
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    prompted_at_utc=excluded.prompted_at_utc
+                """,
+                (
+                    guild_id,
+                    user_id,
+                    now_utc.isoformat(),
+                ),
+            )
+
+
 async def send_transcription_consent_dm(guild: discord.Guild, member: discord.Member):
     dm_channel = member.dm_channel or await member.create_dm()
     await dm_channel.send(
@@ -521,7 +554,13 @@ async def prompt_transcription_consent(
     transcript_thread: discord.Thread,
     members: list[discord.Member],
 ):
-    non_consented = [member for member in members if member.id not in session.consented_user_ids]
+    non_consented: list[discord.Member] = []
+    for member in members:
+        if member.id in session.consented_user_ids:
+            continue
+        if has_transcription_consent_prompt_been_sent(guild.id, member.id):
+            continue
+        non_consented.append(member)
     if not non_consented:
         return
     mentions = " ".join(member.mention for member in non_consented)
@@ -534,6 +573,8 @@ async def prompt_transcription_consent(
     )
     await consent_message.add_reaction(TRANSCRIBE_CONSENT_EMOJI)
     transcription_consent_prompts[consent_message.id] = (guild.id, session.transcript_thread_id)
+    for member in non_consented:
+        await mark_transcription_consent_prompt_sent(guild.id, member.id)
 
 
 async def sync_voice_channel_members_for_transcription(
@@ -564,10 +605,14 @@ async def sync_voice_channel_members_for_transcription(
             session.aliases_by_user[member.id] = display_name
             logger.info("transcribe_member_has_active_consent guild_id=%s user_id=%s display_name=%r", guild.id, member.id, display_name)
             continue
+        already_prompted = has_transcription_consent_prompt_been_sent(guild.id, member.id)
+        if already_prompted:
+            continue
         if member.id not in session.dm_prompted_user_ids:
             try:
                 await send_transcription_consent_dm(guild, member)
                 session.dm_prompted_user_ids.add(member.id)
+                await mark_transcription_consent_prompt_sent(guild.id, member.id)
             except (discord.Forbidden, discord.HTTPException):
                 logger.exception("transcribe_consent_dm_failed guild_id=%s user_id=%s", guild.id, member.id)
     logger.info(
@@ -1257,6 +1302,14 @@ def init_config_db():
             PRIMARY KEY (guild_id, user_id)
         );
         """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS transcription_consent_prompts_sent (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            prompted_at_utc TEXT NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        );
+        """)
         columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(tickets)").fetchall()
@@ -1705,10 +1758,13 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         session.consented_user_ids.add(member.id)
         session.aliases_by_user[member.id] = display_name
         return
+    if has_transcription_consent_prompt_been_sent(member.guild.id, member.id):
+        return
     if member.id not in session.dm_prompted_user_ids:
         try:
             await send_transcription_consent_dm(member.guild, member)
             session.dm_prompted_user_ids.add(member.id)
+            await mark_transcription_consent_prompt_sent(member.guild.id, member.id)
         except (discord.Forbidden, discord.HTTPException):
             pass
     if thread is not None:
