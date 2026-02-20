@@ -1986,7 +1986,7 @@ async def gtranscribe(interaction: discord.Interaction):
     await transcript_thread.send(
         (
             f"🎙️ **Transcription session has begun** for {voice_channel.mention}.\n"
-            "If you have not already consented, check your DMs and run `/gsetname <display name>`."
+            "To change your display name `/gsetname <display name>`."
         )
     )
 
@@ -2079,7 +2079,7 @@ async def gtranscribe(interaction: discord.Interaction):
 
 
 @discord.guild_only()
-@bot.slash_command(name="gsetname", description="Set your transcription display name and renew consent.")
+@bot.slash_command(name="gsetname", description="Set your transcription display name")
 async def gsetname(
     interaction: discord.Interaction,
     name: discord.Option(str, "Display name to use in transcripts"),
@@ -2097,7 +2097,7 @@ async def gsetname(
         session.consented_user_ids.add(interaction.user.id)
         session.aliases_by_user[interaction.user.id] = clean_name
     await interaction.response.send_message(
-        f"✅ Saved transcript display name **{clean_name}** and renewed consent for {TRANSCRIBE_CONSENT_VALID_DAYS} days.",
+        f"✅ Saved transcript display name **{clean_name}**.",
         ephemeral=True,
     )
 
@@ -2148,7 +2148,7 @@ async def gokibothelp(interaction: discord.Interaction):
         "- `/gqueue` — Show the current playback queue.",
         "- `/gskip` — Skip the currently playing track.",
         "- `/gtranscribe` — Start live transcription in a timestamped transcript thread.",
-        "- `/gsetname <name>` — Set your transcript display name and renew consent.",
+        "- `/gsetname <name>` — Set your transcript display name",
         "- `/gendsession` — Stop live transcription and disconnect.",
         "- `/gokibothelp` — Show this help message."
     ]
