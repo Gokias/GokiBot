@@ -505,7 +505,20 @@ async def prompt_transcription_consent(
             "Only users who react on this message are transcribed for this session."
         )
     )
-    await consent_message.add_reaction(TRANSCRIBE_CONSENT_EMOJI)
+    try:
+        await consent_message.add_reaction(TRANSCRIBE_CONSENT_EMOJI)
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception(
+            "transcribe_consent_reaction_failed guild_id=%s thread_id=%s message_id=%s",
+            guild.id,
+            transcript_thread.id,
+            consent_message.id,
+        )
+        await transcript_thread.send(
+            "⚠️ I couldn't add the consent reaction automatically. "
+            f"Please grant **Add Reactions** in this text channel, then manually react with {TRANSCRIBE_CONSENT_EMOJI} "
+            "to the consent message to opt in."
+        )
     session.latest_consent_message_id = consent_message.id
     session.latest_consent_jump_url = consent_message.jump_url
     transcription_consent_prompts[consent_message.id] = (guild.id, session.transcript_thread_id)
@@ -541,6 +554,10 @@ async def sync_voice_channel_members_for_transcription(
             logger.info("transcribe_thread_add_user_ok guild_id=%s thread_id=%s user_id=%s", guild.id, transcript_thread.id, member.id)
         except (discord.Forbidden, discord.HTTPException):
             logger.exception("transcribe_thread_add_user_failed guild_id=%s thread_id=%s user_id=%s", guild.id, transcript_thread.id, member.id)
+            await transcript_thread.send(
+                f"⚠️ I couldn't add {member.mention} to this transcript thread. "
+                "Grant **Manage Threads** for this text channel so I can add members for consent."
+            )
         if member.id in session.prompted_user_ids:
             logger.info(
                 "transcribe_consent_dm_skip guild_id=%s user_id=%s prompt_reason=session_already_prompted",
@@ -1058,6 +1075,57 @@ def is_youtube_url(value: str) -> bool:
         "www.youtu.be",
     }
     return hostname in youtube_hosts
+
+
+def build_transcribe_permission_error(
+    interaction: discord.Interaction,
+    voice_channel: discord.VoiceChannel,
+) -> str | None:
+    if interaction.guild is None or interaction.channel is None or bot.user is None:
+        return None
+    bot_member = interaction.guild.get_member(bot.user.id)
+    if bot_member is None:
+        return (
+            "❌ I couldn't verify my server permissions. Ensure I am a member of this server and retry `/gtranscribe`."
+        )
+
+    text_perms = interaction.channel.permissions_for(bot_member)
+    voice_perms = voice_channel.permissions_for(bot_member)
+    missing_text: list[str] = []
+    missing_voice: list[str] = []
+
+    text_requirements = [
+        ("view_channel", "View Channel"),
+        ("send_messages", "Send Messages"),
+        ("create_private_threads", "Create Private Threads"),
+        ("send_messages_in_threads", "Send Messages in Threads"),
+        ("manage_threads", "Manage Threads (needed to add users to the transcript thread)"),
+        ("add_reactions", "Add Reactions (needed for consent flow)"),
+        ("read_message_history", "Read Message History (needed for reactions)"),
+    ]
+    voice_requirements = [
+        ("connect", "Connect"),
+        ("speak", "Speak"),
+        ("use_voice_activation", "Use Voice Activity (needed to stay connected)"),
+    ]
+    for attr_name, label in text_requirements:
+        if not getattr(text_perms, attr_name, False):
+            missing_text.append(label)
+    for attr_name, label in voice_requirements:
+        if not getattr(voice_perms, attr_name, False):
+            missing_voice.append(label)
+
+    if not missing_text and not missing_voice:
+        return None
+
+    lines = ["❌ Cannot start `/gtranscribe` because required permissions are missing."]
+    if missing_text:
+        lines.append(f"- **Grant in text channel {interaction.channel.mention}:** {', '.join(missing_text)}")
+    if missing_voice:
+        lines.append(f"- **Grant in voice channel {voice_channel.mention}:** {', '.join(missing_voice)}")
+    return "\n".join(lines)
+
+
 async def ensure_voice_channel(interaction: discord.Interaction) -> discord.VoiceChannel | None:
     if interaction.guild is None:
         return None
@@ -2305,6 +2373,10 @@ async def gtranscribe(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
+    permission_error = build_transcribe_permission_error(interaction, voice_channel)
+    if permission_error is not None:
+        await interaction.response.send_message(permission_error, ephemeral=True)
+        return
     engine_init_started = time.monotonic()
     engine_name, engine_instance = get_whisper_transcriber()
     if engine_name is None or engine_instance is None:
@@ -2328,10 +2400,18 @@ async def gtranscribe(interaction: discord.Interaction):
     )
 
     start_label = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
-    transcript_thread = await interaction.channel.create_thread(
-        name=f"transcript-{start_label}",
-        type=discord.ChannelType.private_thread,
-    )
+    try:
+        transcript_thread = await interaction.channel.create_thread(
+            name=f"transcript-{start_label}",
+            type=discord.ChannelType.private_thread,
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception("transcribe_create_thread_failed context=%r", build_interaction_log_context(interaction, vc=getattr(interaction.guild, "voice_client", None)))
+        await interaction.followup.send(
+            "I couldn't create the transcript thread. Grant **Create Private Threads**, **Send Messages in Threads**, and **Manage Threads** in this text channel, then retry `/gtranscribe`.",
+            ephemeral=True,
+        )
+        return
     await transcript_thread.send(
         (
             f"Transcription started for {voice_channel.mention}.\n"
