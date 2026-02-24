@@ -566,7 +566,6 @@ def capture_chunk_from_sink_audio(
     user_id: int,
     audio_obj: object,
     capture_dir: Path,
-    capture_offset_seconds: float,
 ) -> dict[str, object] | None:
     file_obj = getattr(audio_obj, "file", None)
     if file_obj is None:
@@ -597,7 +596,7 @@ def capture_chunk_from_sink_audio(
         frames = wav_in.readframes(delta_frames)
         params = wav_in.getparams()
     session.user_last_frame[user_id] = total_frames
-    chunk_start = capture_offset_seconds + (last_frame / max(framerate, 1))
+    chunk_start = last_frame / max(framerate, 1)
     session.chunk_index += 1
     chunk_file = capture_dir / f"chunk_{session.chunk_index:06d}_u{user_id}.wav"
     with wave.open(str(chunk_file), "wb") as wav_out:
@@ -625,7 +624,6 @@ async def flush_active_recording_buffers(session: GuildTranscriptionSession, gui
     session.capture_index += 1
     capture_dir = session.temp_dir / f"capture_{session.capture_index:05d}"
     capture_dir.mkdir(parents=True, exist_ok=True)
-    capture_offset_seconds = (datetime.now(timezone.utc) - session.started_at).total_seconds()
     produced = 0
     if not session.consented_user_ids:
         guild = bot.get_guild(guild_id)
@@ -644,7 +642,7 @@ async def flush_active_recording_buffers(session: GuildTranscriptionSession, gui
     for user_id, audio_obj in sink_audio_data.items():
         if not isinstance(user_id, int) or user_id not in session.consented_user_ids:
             continue
-        chunk = capture_chunk_from_sink_audio(session, user_id, audio_obj, capture_dir, capture_offset_seconds)
+        chunk = capture_chunk_from_sink_audio(session, user_id, audio_obj, capture_dir)
         if chunk is None:
             continue
         produced += 1
