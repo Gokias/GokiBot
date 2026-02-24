@@ -353,6 +353,7 @@ class GuildTranscriptionSession:
         self.user_last_frame: dict[int, int] = {}
         self.chunk_meta_path = self.temp_dir / "chunk_metadata.jsonl"
         self.finalized = False
+        self.no_consented_users_warning_interval = 10
 
 
 transcription_sessions: dict[int, GuildTranscriptionSession] = {}
@@ -626,6 +627,20 @@ async def flush_active_recording_buffers(session: GuildTranscriptionSession, gui
     capture_dir.mkdir(parents=True, exist_ok=True)
     capture_offset_seconds = (datetime.now(timezone.utc) - session.started_at).total_seconds()
     produced = 0
+    if not session.consented_user_ids:
+        guild = bot.get_guild(guild_id)
+        voice_member_count = 0
+        if guild is not None:
+            voice_channel = guild.get_channel(session.voice_channel_id)
+            voice_member_count = len(getattr(voice_channel, "members", []) or [])
+        warning_interval = max(1, session.no_consented_users_warning_interval)
+        if session.capture_index % warning_interval == 0:
+            logger.warning(
+                "transcribe_capture_skipped_no_consented_users guild_id=%s capture=%s voice_member_count=%s",
+                guild_id,
+                session.capture_index,
+                voice_member_count,
+            )
     for user_id, audio_obj in sink_audio_data.items():
         if not isinstance(user_id, int) or user_id not in session.consented_user_ids:
             continue
@@ -639,11 +654,12 @@ async def flush_active_recording_buffers(session: GuildTranscriptionSession, gui
         except asyncio.QueueFull:
             logger.warning("transcribe_queue_backpressure guild_id=%s chunk_id=%s", guild_id, chunk["chunk_id"])
     logger.info(
-        "transcribe_capture_flushed guild_id=%s capture=%s produced_chunks=%s queue_size=%s",
+        "transcribe_capture_flushed guild_id=%s capture=%s produced_chunks=%s queue_size=%s consented_count=%s",
         guild_id,
         session.capture_index,
         produced,
         session.chunk_queue.qsize(),
+        len(session.consented_user_ids),
     )
     return produced
 
