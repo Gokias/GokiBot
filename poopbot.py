@@ -891,15 +891,9 @@ def build_transcript_lines_for_chunk(
         rel_start = float(utterance.get("start") or 0.0)
         absolute_start = base_offset + rel_start
         stamp = slice_timestamp_label(session.started_at, absolute_start)
-        confidence = utterance.get("confidence")
-        latency_ms = max((time.perf_counter() - emitted_at) * 1000, 0.0) if emitted_at else 0.0
-        confidence_str = f"{float(confidence):.2f}" if isinstance(confidence, (int, float)) else "n/a"
         lines.append({
             "absolute_start": absolute_start,
-            "line": (
-                f"[{stamp}] [{speaker_name}] {deduped_phrase} "
-                f"(conf={confidence_str}, latency={latency_ms:.0f}ms)"
-            ),
+            "line": f"[{stamp}] [{speaker_name}] {deduped_phrase}",
         })
     lines.sort(key=lambda item: item["absolute_start"])
     return lines
@@ -2784,7 +2778,12 @@ async def gendsession(interaction: discord.Interaction):
         )
         return
     vc = interaction.guild.voice_client
-    await interaction.response.defer(ephemeral=True)
+    response_open = True
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.NotFound:
+        response_open = False
+        logger.warning("gendsession_interaction_expired guild_id=%s", interaction.guild.id)
     try:
         await finalize_transcription_session(interaction.guild, session, vc)
     except asyncio.TimeoutError:
@@ -2799,7 +2798,8 @@ async def gendsession(interaction: discord.Interaction):
         except (discord.HTTPException, discord.ClientException):
             pass
     remove_transcription_session(interaction.guild.id)
-    await interaction.followup.send("✅ Transcription capture ended. Final transcript generated.", ephemeral=True)
+    if response_open:
+        await interaction.followup.send("✅ Transcription capture ended. Final transcript generated.", ephemeral=True)
 
 
 @bot.slash_command(name="gokibothelp", description="Show all available GokiBot commands.")
