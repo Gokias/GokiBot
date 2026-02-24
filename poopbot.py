@@ -165,6 +165,9 @@ TRANSCRIBE_CONSENT_EMOJI = "✅"
 TRANSCRIBE_MODEL_SIZE = (os.getenv("TRANSCRIBE_MODEL_SIZE") or os.getenv("WHISPER_MODEL") or "base").strip().lower() or "base"
 if TRANSCRIBE_MODEL_SIZE not in {"tiny", "base", "small"}:
     TRANSCRIBE_MODEL_SIZE = "base"
+TRANSCRIBE_LANGUAGE = (os.getenv("TRANSCRIBE_LANGUAGE") or "en").strip().lower() or "en"
+TRANSCRIBE_FALLBACK_AVG_LOGPROB = float(os.getenv("TRANSCRIBE_FALLBACK_AVG_LOGPROB", "-1.2"))
+TRANSCRIBE_BEAM_SIZE = max(int(os.getenv("TRANSCRIBE_BEAM_SIZE", "5")), 1)
 # =========================
 # MESSAGES
 # =========================
@@ -428,20 +431,54 @@ def get_whisper_transcriber() -> tuple[str | None, object | None]:
 def transcribe_audio_file(engine_name: str, engine: object, file_path: Path) -> list[dict[str, object]]:
     utterances: list[dict[str, object]] = []
     if engine_name == "faster_whisper":
-        segments, _ = engine.transcribe(str(file_path), vad_filter=True)
-        for seg in segments:
-            phrase = (seg.text or "").strip()
-            if not phrase:
-                continue
-            confidence = getattr(seg, "avg_logprob", None)
-            utterances.append({
-                "start": float(getattr(seg, "start", 0.0) or 0.0),
-                "text": phrase,
-                "confidence": float(confidence) if isinstance(confidence, (int, float)) else None,
-            })
+        def _collect_segments(segments_iterable: object) -> list[dict[str, object]]:
+            collected: list[dict[str, object]] = []
+            for seg in segments_iterable:
+                phrase = (seg.text or "").strip()
+                if not phrase:
+                    continue
+                confidence = getattr(seg, "avg_logprob", None)
+                collected.append({
+                    "start": float(getattr(seg, "start", 0.0) or 0.0),
+                    "text": phrase,
+                    "confidence": float(confidence) if isinstance(confidence, (int, float)) else None,
+                })
+            return collected
+        transcribe_kwargs = {
+            "vad_filter": True,
+            "task": "transcribe",
+            "condition_on_previous_text": True,
+            "beam_size": TRANSCRIBE_BEAM_SIZE,
+            "vad_parameters": {"min_silence_duration_ms": 500},
+        }
+        segments, info = engine.transcribe(str(file_path), language=TRANSCRIBE_LANGUAGE, **transcribe_kwargs)
+        utterances = _collect_segments(segments)
+        confidence_values = [item["confidence"] for item in utterances if isinstance(item.get("confidence"), float)]
+        avg_logprob = (sum(confidence_values) / len(confidence_values)) if confidence_values else None
+        if avg_logprob is not None and avg_logprob < TRANSCRIBE_FALLBACK_AVG_LOGPROB:
+            logger.info(
+                "transcribe_fallback_to_auto_language file=%s avg_logprob=%.3f threshold=%.3f detected_language=%s",
+                file_path,
+                avg_logprob,
+                TRANSCRIBE_FALLBACK_AVG_LOGPROB,
+                getattr(info, "language", None),
+            )
+            retry_segments, retry_info = engine.transcribe(str(file_path), language=None, **transcribe_kwargs)
+            retry_utterances = _collect_segments(retry_segments)
+            retry_confidence_values = [item["confidence"] for item in retry_utterances if isinstance(item.get("confidence"), float)]
+            retry_avg_logprob = (sum(retry_confidence_values) / len(retry_confidence_values)) if retry_confidence_values else None
+            if retry_avg_logprob is not None and (avg_logprob is None or retry_avg_logprob > avg_logprob):
+                logger.info(
+                    "transcribe_fallback_selected_auto_language file=%s previous_avg=%.3f fallback_avg=%.3f fallback_language=%s",
+                    file_path,
+                    avg_logprob,
+                    retry_avg_logprob,
+                    getattr(retry_info, "language", None),
+                )
+                return retry_utterances
         return utterances
     if engine_name == "whisper":
-        result = engine.transcribe(str(file_path), fp16=False)
+        result = engine.transcribe(str(file_path), fp16=False, language=TRANSCRIBE_LANGUAGE, task="transcribe")
         segments = result.get("segments") if isinstance(result, dict) else None
         if isinstance(segments, list):
             for seg in segments:
