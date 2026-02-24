@@ -491,11 +491,13 @@ async def prompt_transcription_consent(
         )
         return
     mentions = " ".join(member.mention for member in non_consented)
-    consent_message = await transcript_thread.send(
-        (
+    consent_message = await transcript_thread.send(f"{mentions}\nPreparing consent instructions…")
+    await consent_message.edit(
+        content=(
             f"{mentions}\n"
-            f"React with {TRANSCRIBE_CONSENT_EMOJI} to opt into transcription for this session. "
-            "Only users who react in this thread are transcribed for this session."
+            f"React with {TRANSCRIBE_CONSENT_EMOJI} on this exact message to opt into transcription for this session.\n"
+            f"Required reaction location: {transcript_thread.mention} → {consent_message.jump_url}\n"
+            "Only users who react on this message are transcribed for this session."
         )
     )
     await consent_message.add_reaction(TRANSCRIBE_CONSENT_EMOJI)
@@ -2247,6 +2249,7 @@ async def gtranscribe(interaction: discord.Interaction):
         (
             f"Transcription started for {voice_channel.mention}.\n"
             f"React with {TRANSCRIBE_CONSENT_EMOJI} on the consent message to be included in this session.\n"
+            "React on the consent message in the transcript thread, not on the slash-command response.\n"
             "Use /gsetname to set your name for this session."
         )
     )
@@ -2294,7 +2297,16 @@ async def gtranscribe(interaction: discord.Interaction):
     session = GuildTranscriptionSession(interaction.guild.id, voice_channel.id, transcript_thread.id)
     session.engine_name = engine_name
     session.engine_instance = engine_instance
+    if isinstance(interaction.user, discord.Member):
+        session.consented_user_ids.add(interaction.user.id)
+        clean_name = normalize_transcript_display_name(interaction.user.display_name)
+        if clean_name:
+            session.aliases_by_user[interaction.user.id] = clean_name
     transcription_sessions[interaction.guild.id] = session
+    await transcript_thread.send(
+        f"ℹ️ Auto-consented command invoker {interaction.user.mention} for this session. "
+        "Everyone else must react on the consent message."
+    )
     await sync_voice_channel_members_for_transcription(interaction.guild, voice_channel, session, transcript_thread)
     logger.info(
         "transcribe_session_initialized guild_id=%s voice_channel_id=%s thread_id=%s consented_users=%s",
@@ -2339,9 +2351,45 @@ async def gtranscribe(interaction: discord.Interaction):
     session.loop_task = asyncio.create_task(transcription_live_loop(interaction.guild.id))
     session.worker_task = asyncio.create_task(transcription_worker_loop(interaction.guild.id))
     await interaction.followup.send(
-        f"🎙️ Transcription capture started in {voice_channel.mention}. Live posts may lag; a complete transcript is guaranteed when `/gendsession` is used.",
+        (
+            f"🎙️ Transcription capture started in {voice_channel.mention}. "
+            "I auto-consented you for this session; other users must react on the consent message in the transcript thread. "
+            "Live posts may lag; a complete transcript is guaranteed when `/gendsession` is used."
+        ),
         ephemeral=True,
     )
+
+
+@discord.guild_only()
+@bot.slash_command(name="gtranscribe_status", description="Debug current transcription consent state")
+async def gtranscribe_status(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    session = get_transcription_session(interaction.guild.id)
+    if session is None or session.closed:
+        await interaction.response.send_message("No active transcription session in this server.", ephemeral=True)
+        return
+    voice_channel = interaction.guild.get_channel(session.voice_channel_id)
+    if not isinstance(voice_channel, discord.VoiceChannel):
+        await interaction.response.send_message(
+            f"Active session found, but voice channel `{session.voice_channel_id}` is unavailable.",
+            ephemeral=True,
+        )
+        return
+    consented_ids = sorted(session.consented_user_ids)
+    lines = [
+        f"Thread: <#{session.transcript_thread_id}>",
+        f"Consented user IDs: `{consented_ids}`",
+        "Current voice members:",
+    ]
+    members = [member for member in voice_channel.members if not member.bot]
+    if not members:
+        lines.append("- *(none)*")
+    for member in members:
+        opted_in = "yes" if member.id in session.consented_user_ids else "no"
+        lines.append(f"- {member.mention} (`{member.id}`): opted_in={opted_in}")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @discord.guild_only()
