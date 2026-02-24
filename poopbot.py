@@ -151,9 +151,20 @@ FETCH_TRACK_INFO_TIMEOUT_SECONDS = 25
 FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
     "Timed out while fetching track info from YouTube. Please try again in a moment."
 )
-TRANSCRIBE_SLICE_SECONDS = max(int(os.getenv("TRANSCRIBE_SLICE_SECONDS", "12")), 5)
+TRANSCRIBE_WINDOW_SECONDS = max(float(os.getenv("TRANSCRIBE_WINDOW_SECONDS", "2.0")), 0.5)
+TRANSCRIBE_OVERLAP_SECONDS = max(float(os.getenv("TRANSCRIBE_OVERLAP_SECONDS", "0.5")), 0.0)
+if TRANSCRIBE_OVERLAP_SECONDS >= TRANSCRIBE_WINDOW_SECONDS:
+    TRANSCRIBE_OVERLAP_SECONDS = max(0.0, TRANSCRIBE_WINDOW_SECONDS - 0.1)
+TRANSCRIBE_EMIT_INTERVAL_SECONDS = max(
+    float(os.getenv("TRANSCRIBE_EMIT_INTERVAL_SECONDS", str(max(0.5, TRANSCRIBE_WINDOW_SECONDS - TRANSCRIBE_OVERLAP_SECONDS)))),
+    0.25,
+)
+TRANSCRIBE_MAX_QUEUE_DEPTH = max(int(os.getenv("TRANSCRIBE_MAX_QUEUE_DEPTH", "128")), 1)
 TRANSCRIBE_MAX_FAILURES = max(int(os.getenv("TRANSCRIBE_MAX_FAILURES", "3")), 1)
 TRANSCRIBE_CONSENT_EMOJI = "✅"
+TRANSCRIBE_MODEL_SIZE = (os.getenv("TRANSCRIBE_MODEL_SIZE") or os.getenv("WHISPER_MODEL") or "base").strip().lower() or "base"
+if TRANSCRIBE_MODEL_SIZE not in {"tiny", "base", "small"}:
+    TRANSCRIBE_MODEL_SIZE = "base"
 # =========================
 # MESSAGES
 # =========================
@@ -345,12 +356,14 @@ class GuildTranscriptionSession:
         self.engine_instance: object | None = None
         self.capture_index = 0
         self.chunk_index = 0
-        self.chunk_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=128)
+        self.chunk_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=TRANSCRIBE_MAX_QUEUE_DEPTH)
         self.chunk_meta: list[dict[str, object]] = []
         self.chunk_meta_by_id: dict[int, dict[str, object]] = {}
         self.chunk_transcripts: dict[int, list[dict[str, object]]] = {}
         self.pending_live_lines: list[str] = []
+        self.last_phrase_by_user: dict[int, str] = {}
         self.user_last_frame: dict[int, int] = {}
+        self.user_window_start_frame: dict[int, int] = {}
         self.chunk_meta_path = self.temp_dir / "chunk_metadata.jsonl"
         self.finalized = False
         self.no_consented_users_warning_interval = 10
@@ -405,12 +418,12 @@ def can_record_voice() -> tuple[bool, str]:
 def get_whisper_transcriber() -> tuple[str | None, object | None]:
     if importlib.util.find_spec("faster_whisper") is not None:
         from faster_whisper import WhisperModel
-        model_name = os.getenv("WHISPER_MODEL", "base")
+        model_name = TRANSCRIBE_MODEL_SIZE
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
         return "faster_whisper", model
     if importlib.util.find_spec("whisper") is not None:
         import whisper
-        model_name = os.getenv("WHISPER_MODEL", "base")
+        model_name = TRANSCRIBE_MODEL_SIZE
         model = whisper.load_model(model_name)
         return "whisper", model
     return None, None
@@ -422,9 +435,11 @@ def transcribe_audio_file(engine_name: str, engine: object, file_path: Path) -> 
             phrase = (seg.text or "").strip()
             if not phrase:
                 continue
+            confidence = getattr(seg, "avg_logprob", None)
             utterances.append({
                 "start": float(getattr(seg, "start", 0.0) or 0.0),
                 "text": phrase,
+                "confidence": float(confidence) if isinstance(confidence, (int, float)) else None,
             })
         return utterances
     if engine_name == "whisper":
@@ -437,15 +452,52 @@ def transcribe_audio_file(engine_name: str, engine: object, file_path: Path) -> 
                 phrase = str(seg.get("text") or "").strip()
                 if not phrase:
                     continue
+                confidence = seg.get("avg_logprob")
                 utterances.append({
                     "start": float(seg.get("start") or 0.0),
                     "text": phrase,
+                    "confidence": float(confidence) if isinstance(confidence, (int, float)) else None,
                 })
         else:
             text_value = str((result or {}).get("text") or "").strip() if isinstance(result, dict) else ""
             if text_value:
-                utterances.append({"start": 0.0, "text": text_value})
+                utterances.append({"start": 0.0, "text": text_value, "confidence": None})
     return utterances
+
+
+def normalize_phrase_for_overlap(value: str) -> str:
+    normalized = " ".join(value.lower().split())
+    return "".join(ch for ch in normalized if ch.isalnum() or ch.isspace()).strip()
+
+
+def remove_overlap_duplicate_text(previous_text: str | None, new_text: str) -> str:
+    if not new_text:
+        return ""
+    candidate = new_text.strip()
+    if not candidate:
+        return ""
+    previous = normalize_phrase_for_overlap(previous_text or "")
+    current = normalize_phrase_for_overlap(candidate)
+    if not previous or not current:
+        return candidate
+    if current == previous or current in previous:
+        return ""
+    if previous in current:
+        return candidate
+    prev_tokens = previous.split()
+    curr_tokens = current.split()
+    max_overlap = min(len(prev_tokens), len(curr_tokens))
+    overlap_tokens = 0
+    for length in range(max_overlap, 0, -1):
+        if prev_tokens[-length:] == curr_tokens[:length]:
+            overlap_tokens = length
+            break
+    if overlap_tokens <= 0:
+        return candidate
+    original_tokens = candidate.split()
+    if overlap_tokens >= len(original_tokens):
+        return ""
+    return " ".join(original_tokens[overlap_tokens:]).strip()
 
 
 def normalize_transcript_display_name(name: str) -> str:
@@ -611,15 +663,23 @@ def capture_chunk_from_sink_audio(
     with wav_in:
         framerate = wav_in.getframerate() or 1
         total_frames = wav_in.getnframes()
-        last_frame = session.user_last_frame.get(user_id, 0)
-        if total_frames <= last_frame:
-            return None
-        wav_in.setpos(last_frame)
-        delta_frames = total_frames - last_frame
-        frames = wav_in.readframes(delta_frames)
         params = wav_in.getparams()
+        overlap_frames = max(int(TRANSCRIBE_OVERLAP_SECONDS * framerate), 0)
+        window_frames = max(int(TRANSCRIBE_WINDOW_SECONDS * framerate), 1)
+        last_window_start = session.user_window_start_frame.get(user_id)
+        if last_window_start is None:
+            next_start = 0
+        else:
+            step_frames = max(window_frames - overlap_frames, 1)
+            next_start = max(last_window_start + step_frames, 0)
+        if total_frames - next_start < window_frames:
+            return None
+        wav_in.setpos(next_start)
+        frames = wav_in.readframes(window_frames)
     session.user_last_frame[user_id] = total_frames
-    chunk_start = last_frame / max(framerate, 1)
+    session.user_window_start_frame[user_id] = next_start
+    chunk_start = next_start / max(framerate, 1)
+    chunk_end = (next_start + window_frames) / max(framerate, 1)
     session.chunk_index += 1
     chunk_file = capture_dir / f"chunk_{session.chunk_index:06d}_u{user_id}.wav"
     with wave.open(str(chunk_file), "wb") as wav_out:
@@ -629,6 +689,8 @@ def capture_chunk_from_sink_audio(
         "chunk_id": session.chunk_index,
         "user_id": user_id,
         "start_offset": round(chunk_start, 3),
+        "end_offset": round(chunk_end, 3),
+        "capture_emitted_at": time.perf_counter(),
         "file_path": str(chunk_file),
         "queued": False,
         "transcribed": False,
@@ -696,7 +758,24 @@ async def flush_active_recording_buffers(session: GuildTranscriptionSession, gui
             session.chunk_queue.put_nowait(int(chunk["chunk_id"]))
             chunk["queued"] = True
         except asyncio.QueueFull:
-            logger.warning("transcribe_queue_backpressure guild_id=%s chunk_id=%s", guild_id, chunk["chunk_id"])
+            dropped_chunk_id: int | None = None
+            try:
+                dropped_chunk_id = session.chunk_queue.get_nowait()
+                session.chunk_queue.task_done()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                session.chunk_queue.put_nowait(int(chunk["chunk_id"]))
+                chunk["queued"] = True
+            except asyncio.QueueFull:
+                pass
+            logger.warning(
+                "transcribe_queue_backpressure guild_id=%s chunk_id=%s dropped_chunk_id=%s queue_depth=%s",
+                guild_id,
+                chunk["chunk_id"],
+                dropped_chunk_id,
+                session.chunk_queue.qsize(),
+            )
     logger.info(
         "transcribe_capture_flushed guild_id=%s capture=%s produced_chunks=%s queue_size=%s consented_count=%s",
         guild_id,
@@ -717,17 +796,28 @@ def build_transcript_lines_for_chunk(
     user_id = int(chunk["user_id"])
     speaker_name = resolve_display_name(guild, user_id, session.aliases_by_user)
     base_offset = float(chunk["start_offset"])
+    emitted_at = float(chunk.get("capture_emitted_at") or 0.0)
     lines: list[dict[str, object]] = []
     for utterance in utterances:
         phrase = str(utterance.get("text") or "").strip()
         if not phrase:
             continue
+        deduped_phrase = remove_overlap_duplicate_text(session.last_phrase_by_user.get(user_id), phrase)
+        if not deduped_phrase:
+            continue
+        session.last_phrase_by_user[user_id] = phrase
         rel_start = float(utterance.get("start") or 0.0)
         absolute_start = base_offset + rel_start
         stamp = slice_timestamp_label(session.started_at, absolute_start)
+        confidence = utterance.get("confidence")
+        latency_ms = max((time.perf_counter() - emitted_at) * 1000, 0.0) if emitted_at else 0.0
+        confidence_str = f"{float(confidence):.2f}" if isinstance(confidence, (int, float)) else "n/a"
         lines.append({
             "absolute_start": absolute_start,
-            "line": f"[{stamp}] [{speaker_name}] {phrase}",
+            "line": (
+                f"[{stamp}] [{speaker_name}] {deduped_phrase} "
+                f"(conf={confidence_str}, latency={latency_ms:.0f}ms)"
+            ),
         })
     lines.sort(key=lambda item: item["absolute_start"])
     return lines
@@ -789,9 +879,9 @@ async def transcription_worker_loop(guild_id: int):
 
 
 async def transcription_live_loop(guild_id: int):
-    logger.info("transcribe_live_loop_started guild_id=%s interval_seconds=%s", guild_id, TRANSCRIBE_SLICE_SECONDS)
+    logger.info("transcribe_live_loop_started guild_id=%s interval_seconds=%s", guild_id, TRANSCRIBE_EMIT_INTERVAL_SECONDS)
     while True:
-        await asyncio.sleep(TRANSCRIBE_SLICE_SECONDS)
+        await asyncio.sleep(TRANSCRIBE_EMIT_INTERVAL_SECONDS)
         session = get_transcription_session(guild_id)
         if session is None or session.closed:
             logger.info("transcribe_live_loop_exit guild_id=%s", guild_id)
