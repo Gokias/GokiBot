@@ -1685,20 +1685,64 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if emoji == TRANSCRIBE_CONSENT_EMOJI:
         session = get_transcription_session(payload.guild_id)
         consent_via_prompt = consent_prompt is not None
+        logger.info(
+            "transcribe_consent_reaction_received guild_id=%s message_id=%s channel_id=%s user_id=%s session_present=%s",
+            payload.guild_id,
+            payload.message_id,
+            payload.channel_id,
+            payload.user_id,
+            session is not None,
+        )
         if session is None or session.closed:
+            logger.info(
+                "transcribe_consent_reaction_rejected_session_missing_or_closed guild_id=%s message_id=%s channel_id=%s user_id=%s session_present=%s session_closed=%s",
+                payload.guild_id,
+                payload.message_id,
+                payload.channel_id,
+                payload.user_id,
+                session is not None,
+                session.closed if session is not None else None,
+            )
             return
         if consent_via_prompt:
             guild_id, _ = consent_prompt
             if guild_id != payload.guild_id:
                 return
         elif payload.channel_id != session.transcript_thread_id:
+            logger.info(
+                "transcribe_consent_reaction_rejected_thread_mismatch guild_id=%s message_id=%s channel_id=%s user_id=%s consent_via_prompt=%s expected_thread_id=%s",
+                payload.guild_id,
+                payload.message_id,
+                payload.channel_id,
+                payload.user_id,
+                consent_via_prompt,
+                session.transcript_thread_id,
+            )
             return
         guild = bot.get_guild(payload.guild_id)
         member = guild.get_member(payload.user_id) if guild is not None else None
         if member is None or member.bot:
+            logger.info(
+                "transcribe_consent_reaction_rejected_member_invalid guild_id=%s message_id=%s channel_id=%s user_id=%s guild_present=%s member_present=%s member_is_bot=%s",
+                payload.guild_id,
+                payload.message_id,
+                payload.channel_id,
+                payload.user_id,
+                guild is not None,
+                member is not None,
+                member.bot if member is not None else None,
+            )
             return
         clean_name = normalize_transcript_display_name(member.display_name)
         session.consented_user_ids.add(payload.user_id)
+        logger.info(
+            "transcribe_consent_reaction_accepted guild_id=%s message_id=%s channel_id=%s user_id=%s consented_count=%s",
+            payload.guild_id,
+            payload.message_id,
+            payload.channel_id,
+            payload.user_id,
+            len(session.consented_user_ids),
+        )
         if clean_name:
             session.aliases_by_user[payload.user_id] = clean_name
         thread = find_active_transcription_thread(guild, session)
