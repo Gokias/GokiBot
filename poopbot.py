@@ -539,7 +539,6 @@ async def sync_voice_channel_members_for_transcription(
                 member.id,
             )
             continue
-        session.prompted_user_ids.add(member.id)
     logger.info(
         "transcribe_sync_members_done guild_id=%s discovered_members=%s consented_members=%s",
         guild.id,
@@ -1667,11 +1666,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             member.id,
         )
         return
-    session.prompted_user_ids.add(member.id)
-    if thread is not None:
-        await thread.send(
-            f"{member.mention} transcription in progress. React with {TRANSCRIBE_CONSENT_EMOJI} to be included in this session."
-        )
     if thread is not None:
         await prompt_transcription_consent(member.guild, session, thread, [member])
 
@@ -1686,27 +1680,32 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
     emoji = str(payload.emoji)
     consent_prompt = transcription_consent_prompts.get(payload.message_id)
-    if consent_prompt is not None and emoji == TRANSCRIBE_CONSENT_EMOJI:
-        guild_id, _ = consent_prompt
-        if guild_id != payload.guild_id:
+    if emoji == TRANSCRIBE_CONSENT_EMOJI:
+        session = get_transcription_session(payload.guild_id)
+        consent_via_prompt = consent_prompt is not None
+        if session is None or session.closed:
+            return
+        if consent_via_prompt:
+            guild_id, _ = consent_prompt
+            if guild_id != payload.guild_id:
+                return
+        elif payload.channel_id != session.transcript_thread_id:
             return
         guild = bot.get_guild(payload.guild_id)
         member = guild.get_member(payload.user_id) if guild is not None else None
         if member is None or member.bot:
             return
         clean_name = normalize_transcript_display_name(member.display_name)
-        session = get_transcription_session(payload.guild_id)
-        if session is not None and not session.closed:
-            session.consented_user_ids.add(payload.user_id)
-            if clean_name:
-                session.aliases_by_user[payload.user_id] = clean_name
-            thread = find_active_transcription_thread(guild, session)
-            if thread is not None:
-                try:
-                    await thread.add_user(member)
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
-                await thread.send(f"{member.mention} included for this session.")
+        session.consented_user_ids.add(payload.user_id)
+        if clean_name:
+            session.aliases_by_user[payload.user_id] = clean_name
+        thread = find_active_transcription_thread(guild, session)
+        if thread is not None:
+            try:
+                await thread.add_user(member)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            await thread.send(f"{member.mention} included for this session.")
         return
     active_message_id = gget(payload.guild_id, "active_message_id")
     if not active_message_id or str(payload.message_id) != active_message_id:
