@@ -151,7 +151,7 @@ FETCH_TRACK_INFO_TIMEOUT_SECONDS = 25
 FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
     "Timed out while fetching track info from YouTube. Please try again in a moment."
 )
-TRANSCRIBE_WINDOW_SECONDS = max(float(os.getenv("TRANSCRIBE_WINDOW_SECONDS", "2.0")), 0.5)
+TRANSCRIBE_WINDOW_SECONDS = max(float(os.getenv("TRANSCRIBE_WINDOW_SECONDS", "0.5")), 0.5)
 TRANSCRIBE_OVERLAP_SECONDS = max(float(os.getenv("TRANSCRIBE_OVERLAP_SECONDS", "0.5")), 0.0)
 if TRANSCRIBE_OVERLAP_SECONDS >= TRANSCRIBE_WINDOW_SECONDS:
     TRANSCRIBE_OVERLAP_SECONDS = max(0.0, TRANSCRIBE_WINDOW_SECONDS - 0.1)
@@ -656,9 +656,22 @@ def capture_chunk_from_sink_audio(
         return None
     if not isinstance(payload, (bytes, bytearray)):
         return None
+    logger.info(
+        "transcribe_chunk_debug user_id=%s payload_type=%s payload_len=%s head=%s",
+        user_id,
+        type(payload).__name__,
+        len(payload),
+        bytes(payload[:8]).hex() if len(payload) >= 8 else None,
+    )
     try:
         wav_in = wave.open(io.BytesIO(payload), "rb")
-    except wave.Error:
+    except wave.Error as error:
+        logger.warning(
+            "transcribe_chunk_wave_open_failed user_id=%s payload_len=%s error=%s",
+            user_id,
+            len(payload),
+            error,
+        )
         return None
     with wav_in:
         framerate = wav_in.getframerate() or 1
@@ -673,6 +686,14 @@ def capture_chunk_from_sink_audio(
             step_frames = max(window_frames - overlap_frames, 1)
             next_start = max(last_window_start + step_frames, 0)
         if total_frames - next_start < window_frames:
+            logger.info(
+                "transcribe_chunk_too_short user_id=%s total_frames=%s next_start=%s needed=%s framerate=%s",
+                user_id,
+                total_frames,
+                next_start,
+                window_frames,
+                framerate,
+            )
             return None
         wav_in.setpos(next_start)
         frames = wav_in.readframes(window_frames)
@@ -706,6 +727,13 @@ async def flush_active_recording_buffers(session: GuildTranscriptionSession, gui
     sink_audio_data = getattr(sink, "audio_data", None)
     if not isinstance(sink_audio_data, dict):
         return 0
+
+    logger.info(
+        "transcribe_sink_keys key_types=%s keys=%s consented=%s",
+        [type(key).__name__ for key in sink_audio_data.keys()],
+        list(sink_audio_data.keys()),
+        sorted(session.consented_user_ids),
+    )
 
     guild = bot.get_guild(guild_id)
     voice_channel = guild.get_channel(session.voice_channel_id) if guild is not None else None
@@ -748,9 +776,17 @@ async def flush_active_recording_buffers(session: GuildTranscriptionSession, gui
                 voice_member_count,
             )
     for user_id, audio_obj in sink_audio_data.items():
-        if not isinstance(user_id, int) or user_id not in session.consented_user_ids:
+        normalized_user_id = None
+        if isinstance(user_id, int):
+            normalized_user_id = user_id
+        elif isinstance(user_id, str) and user_id.isdigit():
+            normalized_user_id = int(user_id)
+        elif hasattr(user_id, "id") and isinstance(getattr(user_id, "id"), int):
+            normalized_user_id = int(getattr(user_id, "id"))
+
+        if normalized_user_id is None or normalized_user_id not in session.consented_user_ids:
             continue
-        chunk = capture_chunk_from_sink_audio(session, user_id, audio_obj, capture_dir)
+        chunk = capture_chunk_from_sink_audio(session, normalized_user_id, audio_obj, capture_dir)
         if chunk is None:
             continue
         produced += 1
