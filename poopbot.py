@@ -641,6 +641,10 @@ def capture_chunk_from_sink_audio(
     user_id: int,
     audio_obj: object,
     capture_dir: Path,
+    *,
+    sample_rate: int,
+    sample_width: int,
+    channels: int,
 ) -> dict[str, object] | None:
     file_obj = getattr(audio_obj, "file", None)
     if file_obj is None:
@@ -666,17 +670,19 @@ def capture_chunk_from_sink_audio(
     try:
         wav_in = wave.open(io.BytesIO(payload), "rb")
     except wave.Error as error:
-        logger.warning(
-            "transcribe_chunk_wave_open_failed user_id=%s payload_len=%s error=%s",
+        logger.info(
+            "transcribe_chunk_wave_open_fallback_pcm user_id=%s payload_len=%s error=%s sample_rate=%s channels=%s sample_width=%s",
             user_id,
             len(payload),
             error,
+            sample_rate,
+            channels,
+            sample_width,
         )
-        return None
-    with wav_in:
-        framerate = wav_in.getframerate() or 1
-        total_frames = wav_in.getnframes()
-        params = wav_in.getparams()
+        frame_size = max(sample_width * channels, 1)
+        framerate = max(sample_rate, 1)
+        total_frames = len(payload) // frame_size
+        params = (channels, sample_width, framerate, 0, "NONE", "not compressed")
         overlap_frames = max(int(TRANSCRIBE_OVERLAP_SECONDS * framerate), 0)
         window_frames = max(int(TRANSCRIBE_WINDOW_SECONDS * framerate), 1)
         last_window_start = session.user_window_start_frame.get(user_id)
@@ -695,8 +701,34 @@ def capture_chunk_from_sink_audio(
                 framerate,
             )
             return None
-        wav_in.setpos(next_start)
-        frames = wav_in.readframes(window_frames)
+        start_byte = next_start * frame_size
+        end_byte = (next_start + window_frames) * frame_size
+        frames = bytes(payload[start_byte:end_byte])
+    else:
+        with wav_in:
+            framerate = wav_in.getframerate() or 1
+            total_frames = wav_in.getnframes()
+            params = wav_in.getparams()
+            overlap_frames = max(int(TRANSCRIBE_OVERLAP_SECONDS * framerate), 0)
+            window_frames = max(int(TRANSCRIBE_WINDOW_SECONDS * framerate), 1)
+            last_window_start = session.user_window_start_frame.get(user_id)
+            if last_window_start is None:
+                next_start = 0
+            else:
+                step_frames = max(window_frames - overlap_frames, 1)
+                next_start = max(last_window_start + step_frames, 0)
+            if total_frames - next_start < window_frames:
+                logger.info(
+                    "transcribe_chunk_too_short user_id=%s total_frames=%s next_start=%s needed=%s framerate=%s",
+                    user_id,
+                    total_frames,
+                    next_start,
+                    window_frames,
+                    framerate,
+                )
+                return None
+            wav_in.setpos(next_start)
+            frames = wav_in.readframes(window_frames)
     session.user_last_frame[user_id] = total_frames
     session.user_window_start_frame[user_id] = next_start
     chunk_start = next_start / max(framerate, 1)
@@ -736,6 +768,12 @@ async def flush_active_recording_buffers(session: GuildTranscriptionSession, gui
     )
 
     guild = bot.get_guild(guild_id)
+    vc = guild.voice_client if guild is not None else None
+    decoder = getattr(vc, "decoder", None)
+    sample_rate = int(getattr(decoder, "SAMPLING_RATE", 48000) or 48000)
+    channels = int(getattr(decoder, "CHANNELS", 2) or 2)
+    sample_size = int(getattr(decoder, "SAMPLE_SIZE", channels * 2) or channels * 2)
+    sample_width = max(sample_size // max(channels, 1), 1)
     voice_channel = guild.get_channel(session.voice_channel_id) if guild is not None else None
     voice_members = getattr(voice_channel, "members", []) if voice_channel is not None else []
     voice_member_ids = {member.id for member in voice_members if isinstance(member, discord.Member) and not member.bot}
@@ -786,7 +824,15 @@ async def flush_active_recording_buffers(session: GuildTranscriptionSession, gui
 
         if normalized_user_id is None or normalized_user_id not in session.consented_user_ids:
             continue
-        chunk = capture_chunk_from_sink_audio(session, normalized_user_id, audio_obj, capture_dir)
+        chunk = capture_chunk_from_sink_audio(
+            session,
+            normalized_user_id,
+            audio_obj,
+            capture_dir,
+            sample_rate=sample_rate,
+            sample_width=sample_width,
+            channels=channels,
+        )
         if chunk is None:
             continue
         produced += 1
