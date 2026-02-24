@@ -354,6 +354,10 @@ class GuildTranscriptionSession:
         self.chunk_meta_path = self.temp_dir / "chunk_metadata.jsonl"
         self.finalized = False
         self.no_consented_users_warning_interval = 10
+        self.latest_consent_message_id: int | None = None
+        self.latest_consent_jump_url: str | None = None
+        self.last_unconsented_reminder_at: datetime | None = None
+        self.unconsented_reminder_interval_seconds = 45
 
 
 transcription_sessions: dict[int, GuildTranscriptionSession] = {}
@@ -502,6 +506,8 @@ async def prompt_transcription_consent(
         )
     )
     await consent_message.add_reaction(TRANSCRIBE_CONSENT_EMOJI)
+    session.latest_consent_message_id = consent_message.id
+    session.latest_consent_jump_url = consent_message.jump_url
     transcription_consent_prompts[consent_message.id] = (guild.id, session.transcript_thread_id)
     for member in non_consented:
         session.prompted_user_ids.add(member.id)
@@ -621,15 +627,38 @@ async def flush_active_recording_buffers(session: GuildTranscriptionSession, gui
     sink_audio_data = getattr(sink, "audio_data", None)
     if not isinstance(sink_audio_data, dict):
         return 0
+
+    guild = bot.get_guild(guild_id)
+    voice_channel = guild.get_channel(session.voice_channel_id) if guild is not None else None
+    voice_members = getattr(voice_channel, "members", []) if voice_channel is not None else []
+    voice_member_ids = {member.id for member in voice_members if isinstance(member, discord.Member) and not member.bot}
+    active_speaker_ids = {user_id for user_id in sink_audio_data if isinstance(user_id, int) and user_id in voice_member_ids}
+    active_unconsented_ids = sorted(user_id for user_id in active_speaker_ids if user_id not in session.consented_user_ids)
+    if active_unconsented_ids and guild is not None:
+        now = datetime.now(timezone.utc)
+        last_sent = session.last_unconsented_reminder_at
+        min_interval = timedelta(seconds=max(1, session.unconsented_reminder_interval_seconds))
+        if last_sent is None or (now - last_sent) >= min_interval:
+            thread = find_active_transcription_thread(guild, session)
+            if thread is not None:
+                speaker_mentions = " ".join(f"<@{user_id}>" for user_id in active_unconsented_ids)
+                consent_target = session.latest_consent_jump_url or "(consent prompt not posted yet)"
+                await thread.send(
+                    (
+                        f"⚠️ Active speakers detected without consent: {speaker_mentions}.\n"
+                        f"To be included in this session, react with {TRANSCRIBE_CONSENT_EMOJI} to this exact message: {consent_target}\n"
+                        "Only reactions on that exact consent message opt users into transcription."
+                    )
+                )
+                session.last_unconsented_reminder_at = now
+
     session.capture_index += 1
     capture_dir = session.temp_dir / f"capture_{session.capture_index:05d}"
     capture_dir.mkdir(parents=True, exist_ok=True)
     produced = 0
     if not session.consented_user_ids:
-        guild = bot.get_guild(guild_id)
         voice_member_count = 0
         if guild is not None:
-            voice_channel = guild.get_channel(session.voice_channel_id)
             voice_member_count = len(getattr(voice_channel, "members", []) or [])
         warning_interval = max(1, session.no_consented_users_warning_interval)
         if session.capture_index % warning_interval == 0:
@@ -2366,6 +2395,17 @@ async def gtranscribe(interaction: discord.Interaction):
         "Everyone else must react on the consent message."
     )
     await sync_voice_channel_members_for_transcription(interaction.guild, voice_channel, session, transcript_thread)
+    startup_members = [member for member in voice_channel.members if not member.bot]
+    startup_consented = [member.mention for member in startup_members if member.id in session.consented_user_ids]
+    startup_unconsented = [member.mention for member in startup_members if member.id not in session.consented_user_ids]
+    await transcript_thread.send(
+        "\n".join([
+            "📋 Startup consent snapshot:",
+            f"- Consented: {', '.join(startup_consented) if startup_consented else '(none)'}",
+            f"- Not consented: {', '.join(startup_unconsented) if startup_unconsented else '(none)'}",
+            f"- Consent message: {session.latest_consent_jump_url or '(not available yet)'}",
+        ])
+    )
     logger.info(
         "transcribe_session_initialized guild_id=%s voice_channel_id=%s thread_id=%s consented_users=%s",
         interaction.guild.id,
@@ -2438,6 +2478,7 @@ async def gtranscribe_status(interaction: discord.Interaction):
     consented_ids = sorted(session.consented_user_ids)
     lines = [
         f"Thread: <#{session.transcript_thread_id}>",
+        f"Consent message jump URL: {session.latest_consent_jump_url or '(not available yet)'}",
         f"Consented user IDs: `{consented_ids}`",
         "Current voice members:",
     ]
@@ -2445,8 +2486,11 @@ async def gtranscribe_status(interaction: discord.Interaction):
     if not members:
         lines.append("- *(none)*")
     for member in members:
-        opted_in = "yes" if member.id in session.consented_user_ids else "no"
-        lines.append(f"- {member.mention} (`{member.id}`): opted_in={opted_in}")
+        prompted = "yes" if member.id in session.prompted_user_ids else "no"
+        consented = "yes" if member.id in session.consented_user_ids else "no"
+        lines.append(
+            f"- {member.mention} (`{member.id}`): prompted={prompted}, consented={consented}"
+        )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
