@@ -363,7 +363,8 @@ class GuildTranscriptionSession:
         self.chunk_meta: list[dict[str, object]] = []
         self.chunk_meta_by_id: dict[int, dict[str, object]] = {}
         self.chunk_transcripts: dict[int, list[dict[str, object]]] = {}
-        self.pending_live_lines: list[str] = []
+        self.pending_live_entries: list[dict[str, object]] = []
+        self.pending_live_lock = asyncio.Lock()
         self.last_phrase_by_user: dict[int, str] = {}
         self.user_last_frame: dict[int, int] = {}
         self.user_window_start_frame: dict[int, int] = {}
@@ -984,29 +985,37 @@ def build_transcript_lines_for_chunk(
         stamp = slice_timestamp_label(session.started_at, absolute_start)
         lines.append({
             "absolute_start": absolute_start,
+            "chunk_id": int(chunk["chunk_id"]),
             "line": f"[{stamp}] [{speaker_name}] {deduped_phrase}",
         })
     lines.sort(key=lambda item: item["absolute_start"])
     return lines
 
 
-async def try_post_live_lines(guild: discord.Guild | None, session: GuildTranscriptionSession, lines: list[str]) -> bool:
-    if not lines:
+async def try_post_live_lines(
+    guild: discord.Guild | None,
+    session: GuildTranscriptionSession,
+    entries: list[dict[str, object]],
+) -> bool:
+    if not entries:
         return True
     if guild is None:
-        session.pending_live_lines.extend(lines)
+        async with session.pending_live_lock:
+            session.pending_live_entries.extend(entries)
         return False
     thread = find_active_transcription_thread(guild, session)
     if thread is None:
-        session.pending_live_lines.extend(lines)
+        async with session.pending_live_lock:
+            session.pending_live_entries.extend(entries)
         return False
     try:
-        for line in lines:
-            await thread.send(line)
+        for entry in entries:
+            await thread.send(str(entry["line"]))
         return True
     except Exception:
         logger.exception("transcribe_live_post_failed guild_id=%s", session.guild_id)
-        session.pending_live_lines.extend(lines)
+        async with session.pending_live_lock:
+            session.pending_live_entries.extend(entries)
         return False
 
 
@@ -1038,7 +1047,9 @@ async def transcription_worker_loop(guild_id: int):
             lines = build_transcript_lines_for_chunk(bot.get_guild(guild_id), session, chunk, utterances)
             session.chunk_transcripts[chunk_id] = lines
             chunk["transcribed"] = True
-            await try_post_live_lines(bot.get_guild(guild_id), session, [item["line"] for item in lines])
+            if lines:
+                async with session.pending_live_lock:
+                    session.pending_live_entries.extend(lines)
         except Exception:
             logger.exception("transcribe_chunk_failed guild_id=%s chunk_id=%s", guild_id, chunk_id)
         finally:
@@ -1058,10 +1069,22 @@ async def transcription_live_loop(guild_id: int):
         if vc is None or not vc.is_connected() or not getattr(vc, "recording", False):
             continue
         await flush_active_recording_buffers(session, guild_id)
-        if session.pending_live_lines:
-            pending = list(session.pending_live_lines)
-            session.pending_live_lines.clear()
-            await try_post_live_lines(guild, session, pending)
+        emit_cutoff = max(
+            0.0,
+            (datetime.now(timezone.utc) - session.started_at).total_seconds() - TRANSCRIBE_EMIT_INTERVAL_SECONDS,
+        )
+        pending_to_send: list[dict[str, object]] = []
+        async with session.pending_live_lock:
+            still_pending: list[dict[str, object]] = []
+            for entry in session.pending_live_entries:
+                if float(entry.get("absolute_start") or 0.0) <= emit_cutoff:
+                    pending_to_send.append(entry)
+                else:
+                    still_pending.append(entry)
+            session.pending_live_entries = still_pending
+        if pending_to_send:
+            pending_to_send.sort(key=lambda item: (float(item.get("absolute_start") or 0.0), int(item.get("chunk_id") or 0)))
+            await try_post_live_lines(guild, session, pending_to_send)
 
 
 async def finalize_transcription_session(guild: discord.Guild, session: GuildTranscriptionSession, vc: discord.VoiceClient | None) -> Path:
