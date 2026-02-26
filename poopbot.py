@@ -161,6 +161,10 @@ TRANSCRIBE_EMIT_INTERVAL_SECONDS = max(
 )
 TRANSCRIBE_MAX_QUEUE_DEPTH = max(int(os.getenv("TRANSCRIBE_MAX_QUEUE_DEPTH", "128")), 1)
 TRANSCRIBE_MAX_FAILURES = max(int(os.getenv("TRANSCRIBE_MAX_FAILURES", "3")), 1)
+TRANSCRIBE_RECORDING_FAILURE_GRACE_INTERVALS = max(
+    int(os.getenv("TRANSCRIBE_RECORDING_FAILURE_GRACE_INTERVALS", "2")),
+    1,
+)
 TRANSCRIBE_CONSENT_EMOJI = "✅"
 TRANSCRIBE_MODEL_SIZE = (os.getenv("TRANSCRIBE_MODEL_SIZE") or os.getenv("WHISPER_MODEL") or "base").strip().lower() or "base"
 if TRANSCRIBE_MODEL_SIZE not in {"tiny", "base", "small"}:
@@ -1091,8 +1095,46 @@ async def transcription_live_loop(guild_id: int):
             return
         guild = bot.get_guild(guild_id)
         vc = guild.voice_client if guild is not None else None
-        if vc is None or not vc.is_connected() or not getattr(vc, "recording", False):
+        if vc is None or not vc.is_connected():
             continue
+        if not getattr(vc, "recording", False):
+            session.recording_failure_count += 1
+            voice_state = {
+                "connected": vc.is_connected(),
+                "recording": bool(getattr(vc, "recording", False)),
+                "channel_id": getattr(getattr(vc, "channel", None), "id", None),
+            }
+            logger.warning(
+                "transcribe_recording_inactive guild_id=%s voice_state=%s recording_failure_count=%s queue_depth=%s grace_intervals=%s max_failures=%s",
+                guild_id,
+                voice_state,
+                session.recording_failure_count,
+                session.chunk_queue.qsize(),
+                TRANSCRIBE_RECORDING_FAILURE_GRACE_INTERVALS,
+                TRANSCRIBE_MAX_FAILURES,
+            )
+            if session.recording_failure_count <= TRANSCRIBE_RECORDING_FAILURE_GRACE_INTERVALS:
+                continue
+            if session.recording_failure_count > TRANSCRIBE_MAX_FAILURES:
+                await teardown_transcription_session_for_recording_failure(
+                    guild,
+                    session,
+                    (
+                        "voice_client_connected_but_not_recording "
+                        f"after_consecutive_failures={session.recording_failure_count} "
+                        f"queue_depth={session.chunk_queue.qsize()}"
+                    ),
+                )
+                return
+            continue
+        if session.recording_failure_count > 0:
+            logger.info(
+                "transcribe_recording_recovered guild_id=%s recording_failure_count=%s queue_depth=%s",
+                guild_id,
+                session.recording_failure_count,
+                session.chunk_queue.qsize(),
+            )
+        session.recording_failure_count = 0
         await flush_active_recording_buffers(session, guild_id)
         emit_cutoff = max(
             0.0,
@@ -1186,6 +1228,17 @@ async def teardown_transcription_session_for_recording_failure(
 ):
     guild_id = session.guild_id
     session.closed = True
+    current_task = asyncio.current_task()
+    for task_name, task in (("loop_task", session.loop_task), ("worker_task", session.worker_task)):
+        if task is None or task.done() or task is current_task:
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.info("transcribe_teardown_task_cancelled guild_id=%s task=%s", guild_id, task_name)
+        except Exception:
+            logger.exception("transcribe_teardown_task_cancel_failed guild_id=%s task=%s", guild_id, task_name)
     if guild is not None:
         vc = guild.voice_client
         if vc is not None and vc.is_connected():
