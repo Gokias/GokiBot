@@ -360,6 +360,7 @@ class GuildTranscriptionSession:
         self.capture_index = 0
         self.chunk_index = 0
         self.chunk_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=TRANSCRIBE_MAX_QUEUE_DEPTH)
+        self.transcription_inference_lock = asyncio.Semaphore(1)
         self.chunk_meta: list[dict[str, object]] = []
         self.chunk_meta_by_id: dict[int, dict[str, object]] = {}
         self.chunk_transcripts: dict[int, list[dict[str, object]]] = {}
@@ -1043,7 +1044,31 @@ async def transcription_worker_loop(guild_id: int):
             session.chunk_queue.task_done()
             continue
         try:
-            utterances = transcribe_audio_file(engine_name, engine, Path(str(chunk["file_path"])))
+            inference_queue_size_start = session.chunk_queue.qsize()
+            inference_started_at = time.perf_counter()
+            logger.info(
+                "transcribe_inference_started guild_id=%s chunk_id=%s queue_size=%s",
+                guild_id,
+                chunk_id,
+                inference_queue_size_start,
+            )
+            async with session.transcription_inference_lock:
+                utterances = await asyncio.to_thread(
+                    transcribe_audio_file,
+                    engine_name,
+                    engine,
+                    Path(str(chunk["file_path"])),
+                )
+            inference_duration_seconds = time.perf_counter() - inference_started_at
+            inference_queue_size_end = session.chunk_queue.qsize()
+            logger.info(
+                "transcribe_inference_finished guild_id=%s chunk_id=%s duration_seconds=%.3f queue_size=%s backlog_growth=%s",
+                guild_id,
+                chunk_id,
+                inference_duration_seconds,
+                inference_queue_size_end,
+                inference_queue_size_end - inference_queue_size_start,
+            )
             lines = build_transcript_lines_for_chunk(bot.get_guild(guild_id), session, chunk, utterances)
             session.chunk_transcripts[chunk_id] = lines
             chunk["transcribed"] = True
@@ -1106,9 +1131,34 @@ async def finalize_transcription_session(guild: discord.Guild, session: GuildTra
             if chunk.get("transcribed"):
                 continue
             try:
-                utterances = transcribe_audio_file(engine_name, engine, Path(str(chunk["file_path"])))
+                chunk_id = int(chunk["chunk_id"])
+                inference_queue_size_start = session.chunk_queue.qsize()
+                inference_started_at = time.perf_counter()
+                logger.info(
+                    "transcribe_final_inference_started guild_id=%s chunk_id=%s queue_size=%s",
+                    guild.id,
+                    chunk_id,
+                    inference_queue_size_start,
+                )
+                async with session.transcription_inference_lock:
+                    utterances = await asyncio.to_thread(
+                        transcribe_audio_file,
+                        engine_name,
+                        engine,
+                        Path(str(chunk["file_path"])),
+                    )
+                inference_duration_seconds = time.perf_counter() - inference_started_at
+                inference_queue_size_end = session.chunk_queue.qsize()
+                logger.info(
+                    "transcribe_final_inference_finished guild_id=%s chunk_id=%s duration_seconds=%.3f queue_size=%s backlog_growth=%s",
+                    guild.id,
+                    chunk_id,
+                    inference_duration_seconds,
+                    inference_queue_size_end,
+                    inference_queue_size_end - inference_queue_size_start,
+                )
                 lines = build_transcript_lines_for_chunk(guild, session, chunk, utterances)
-                session.chunk_transcripts[int(chunk["chunk_id"])] = lines
+                session.chunk_transcripts[chunk_id] = lines
                 chunk["transcribed"] = True
             except Exception:
                 logger.exception("transcribe_final_pass_failed guild_id=%s chunk_id=%s", guild.id, chunk.get("chunk_id"))
