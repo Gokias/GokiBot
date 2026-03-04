@@ -1587,6 +1587,31 @@ async def play_next_track(guild: discord.Guild):
     voice_client = guild.voice_client
     if voice_client is None:
         return
+    if not voice_client.is_connected():
+        channel = getattr(voice_client, "channel", None)
+        if isinstance(channel, discord.VoiceChannel):
+            try:
+                await voice_client.disconnect(force=True)
+            except (discord.ClientException, discord.HTTPException):
+                pass
+            try:
+                voice_client = await channel.connect(timeout=15.0, reconnect=True)
+            except (discord.ClientException, discord.HTTPException, asyncio.TimeoutError):
+                logger.exception(
+                    "music_voice_reconnect_failed guild_id=%s channel_id=%s state=%s",
+                    guild.id,
+                    channel.id,
+                    describe_voice_client_state(voice_client),
+                )
+                return
+        else:
+            return
+
+    ready = await wait_for_voice_client_ready(voice_client, timeout_seconds=15.0)
+    if not ready:
+        logger.warning("music_voice_not_ready guild_id=%s state=%s", guild.id, describe_voice_client_state(voice_client))
+        return
+
     state = get_music_state(guild.id)
     async with state.lock:
         if voice_client.is_playing() or voice_client.is_paused():
@@ -1632,7 +1657,12 @@ async def play_next_track(guild: discord.Guild):
         except Exception:
             logger.exception("music_next_track_start_failed context=%r", music_context)
     logger.info("music_play_start track=%s context=%r", next_track.title, music_context)
-    voice_client.play(ffmpeg_source, after=_after_playback)
+    try:
+        voice_client.play(ffmpeg_source, after=_after_playback)
+    except discord.ClientException:
+        logger.exception("music_play_start_failed context=%r", music_context)
+        await asyncio.sleep(0.5)
+        await play_next_track(guild)
 # =========================
 # DATABASE HELPERS
 # =========================
