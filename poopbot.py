@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, date, time as dtime, timedelta
 from pathlib import Path
 import time
+import sys
 import discord
 from discord.ext import commands, tasks
 
@@ -2988,6 +2989,12 @@ async def on_ready():
                 await post_button_for_guild(gid, cid)
             except (discord.Forbidden, discord.NotFound, discord.HTTPException):
                 continue
+    logger.info(
+        "discord_runtime discord_version=%s python_version=%s opus_loaded=%s",
+        discord.__version__,
+        sys.version.split()[0],
+        discord.opus.is_loaded(),
+    )
     logger.info("bot_ready user=%s user_id=%s", bot.user, bot.user.id)
 if not TOKEN or TOKEN == "PUT_TOKEN_HERE_FOR_TESTING":
     raise RuntimeError("Set DISCORD_TOKEN_POOPBOT env var or paste token into TOKEN.")
