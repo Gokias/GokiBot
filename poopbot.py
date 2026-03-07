@@ -3,6 +3,7 @@ import os
 import math
 import uuid
 import random
+import re
 import sqlite3
 import asyncio
 import urllib.request
@@ -1016,6 +1017,55 @@ async def log_event(
     return event_id
 
 
+async def replay_event_from_history(
+    event_id: str,
+    event_type: str,
+    created_at_utc: datetime,
+    user_id: int,
+    username: str,
+    guild_id: int | None,
+    channel_id: int | None,
+    message_id: int | None,
+    target_event_id: str | None = None,
+    note: str | None = None,
+) -> bool:
+    local = created_at_utc.astimezone(LOCAL_TZ)
+    event_year = local.year
+    init_year_db(event_year)
+
+    async with db_write_lock:
+        with db_year(event_year) as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO events(
+                    event_id, event_type,
+                    timestamp_utc, timestamp_local,
+                    date_local, time_local,
+                    user_id, username,
+                    guild_id, channel_id, message_id,
+                    target_event_id, note
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    event_type,
+                    created_at_utc.isoformat(),
+                    local.isoformat(),
+                    local.date().isoformat(),
+                    local.time().replace(microsecond=0).isoformat(),
+                    user_id,
+                    username,
+                    guild_id,
+                    channel_id,
+                    message_id,
+                    target_event_id,
+                    note,
+                ),
+            )
+            return cur.rowcount > 0
+
+
 async def log_cleanup_message(message: discord.Message):
     created_at = message.created_at.astimezone(timezone.utc)
     async with db_write_lock:
@@ -1764,6 +1814,117 @@ async def gskip(interaction: discord.Interaction):
     vc.stop()
     await interaction.response.send_message("⏭️ Skipped current track.", ephemeral=True)
 
+
+@bot.tree.command(
+    name="rebuildpoopdb",
+    description="Rebuild poop/undo events by replaying bot messages in the configured poop channel.",
+)
+@app_commands.guild_only()
+async def rebuildpoopdb(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return
+
+    if not is_dev_user(interaction.user.id):
+        await interaction.response.send_message(
+            "Only the configured dev user can run this command.",
+            ephemeral=True,
+        )
+        return
+
+    cfg = get_guild_config(interaction.guild.id)
+    if not cfg:
+        await interaction.response.send_message(
+            "No poop channel is configured. Run /setpoopchannel first.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    channel_id = int(cfg["channel_id"])
+    try:
+        channel = await bot.fetch_channel(channel_id)
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        await interaction.followup.send(
+            "I couldn't access the configured poop channel.",
+            ephemeral=True,
+        )
+        return
+
+    mention_pattern = re.compile(r"<@!?(\d+)>")
+    congrats_templates = set(CONGRATS)
+    undo_templates = set(UNDO_MSGS)
+    active_poops_by_user_year: dict[tuple[int, int], list[str]] = {}
+
+    scanned = 0
+    rebuilt_poops = 0
+    rebuilt_undos = 0
+    skipped_undo_without_target = 0
+
+    async for message in channel.history(limit=None, oldest_first=True):
+        scanned += 1
+        if message.author.id != bot.user.id:
+            continue
+
+        mention_match = mention_pattern.search(message.content)
+        if mention_match is None:
+            continue
+
+        user_id = int(mention_match.group(1))
+        normalized = mention_pattern.sub("{user}", message.content).strip()
+
+        if normalized in congrats_templates:
+            event_type = "POOP"
+        elif normalized in undo_templates:
+            event_type = "UNDO"
+        else:
+            continue
+
+        created_at_utc = message.created_at.astimezone(timezone.utc)
+        local_year = created_at_utc.astimezone(LOCAL_TZ).year
+        key = (user_id, local_year)
+
+        target_event_id = None
+        if event_type == "UNDO":
+            stack = active_poops_by_user_year.get(key, [])
+            if not stack:
+                skipped_undo_without_target += 1
+                continue
+            target_event_id = stack.pop()
+
+        event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"rebuild:{event_type}:{message.id}"))
+        username = str(message.mentions[0]) if message.mentions else f"user-{user_id}"
+        inserted = await replay_event_from_history(
+            event_id=event_id,
+            event_type=event_type,
+            created_at_utc=created_at_utc,
+            user_id=user_id,
+            username=username,
+            guild_id=interaction.guild.id,
+            channel_id=channel.id,
+            message_id=message.id,
+            target_event_id=target_event_id,
+            note=f"replayed_from_channel_message:{message.id}",
+        )
+
+        if event_type == "POOP":
+            active_poops_by_user_year.setdefault(key, []).append(event_id)
+            if inserted:
+                rebuilt_poops += 1
+        elif inserted:
+            rebuilt_undos += 1
+
+    await interaction.followup.send(
+        (
+            f"Replay complete for <#{channel.id}>.\n"
+            f"- Scanned messages: **{scanned}**\n"
+            f"- Rebuilt POOP events: **{rebuilt_poops}**\n"
+            f"- Rebuilt UNDO events: **{rebuilt_undos}**\n"
+            f"- Skipped UNDOs with no prior POOP in replay: **{skipped_undo_without_target}**"
+        ),
+        ephemeral=True,
+    )
+
 @bot.tree.command(name="gokibothelp", description="Show all available GokiBot commands.")
 async def gokibothelp(interaction: discord.Interaction):
     command_lines = [
@@ -1784,6 +1945,7 @@ async def gokibothelp(interaction: discord.Interaction):
             "- `/setpoopchannel` — Set the poop logging channel (admin only).",
             "- `/disablepoop` — Disable poop posting (admin only).",
             "- `/debugpoop` — Force-create a new poop button (admin only).",
+            "- `/rebuildpoopdb` — Rebuild poop data from channel history (dev only).",
             "- `/closeticket` — Close the current ticket thread (dev only)."
         ])
 
