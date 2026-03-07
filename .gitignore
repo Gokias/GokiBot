@@ -1,0 +1,6 @@
+.env
+db/
+logs/
+tmp_audio/
+*.db
+*.sqlite
