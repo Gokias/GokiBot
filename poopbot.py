@@ -499,8 +499,8 @@ def extract_webpage_url(info: dict[str, object], source: str) -> str:
 
 def extract_stream_url(info: dict[str, object]) -> str:
     direct_url = str(info.get("url") or "").strip()
-    if is_http_url(direct_url):
-        return direct_url
+    direct_vcodec = str(info.get("vcodec") or "").lower()
+    direct_url_is_audio_only = direct_vcodec == "none"
 
     requested_formats = info.get("requested_formats")
     if isinstance(requested_formats, list):
@@ -514,7 +514,12 @@ def extract_stream_url(info: dict[str, object]) -> str:
                 return format_url
 
     formats = info.get("formats")
+    if direct_url_is_audio_only and is_http_url(direct_url):
+        return direct_url
+
     if not isinstance(formats, list):
+        if is_http_url(direct_url):
+            return direct_url
         raise RuntimeError("yt-dlp did not provide an audio stream URL.")
 
     def _is_hls_protocol(fmt: dict[str, object]) -> bool:
@@ -712,7 +717,6 @@ def build_ffmpeg_before_options(source_url: str) -> str:
         "-reconnect 1",
         "-reconnect_streamed 1",
         "-reconnect_delay_max 5",
-        "-http_persistent 0",
         "-fflags +genpts+nobuffer",
         "-flags low_delay",
         "-analyzeduration 0",
