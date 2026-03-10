@@ -258,6 +258,7 @@ class QueueTrack:
     source_url: str
     duration_seconds: int
     requested_by: int
+    stream_url: str | None = None
 
 
 class GuildMusicState:
@@ -428,6 +429,7 @@ def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTr
                     source_url=webpage_url,
                     duration_seconds=duration_seconds,
                     requested_by=0,
+                    stream_url=None,
                 )
             )
 
@@ -445,12 +447,19 @@ def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTr
 
     webpage_url = str(track_info.get("webpage_url") or info.get("webpage_url") or source)
 
+    stream_url: str | None = None
+    try:
+        stream_url = extract_stream_url(track_info)
+    except RuntimeError:
+        stream_url = None
+
     return [
         QueueTrack(
             title=title,
             source_url=webpage_url,
             duration_seconds=duration_seconds,
             requested_by=0,
+            stream_url=stream_url,
         )
     ]
 
@@ -555,7 +564,10 @@ async def play_next_track(guild: discord.Guild):
         state.track_started_at = datetime.now(timezone.utc)
 
     try:
-        stream_url = await resolve_stream_url(next_track.source_url)
+        if next_track.stream_url:
+            stream_url = next_track.stream_url
+        else:
+            stream_url = await resolve_stream_url(next_track.source_url)
     except RuntimeError as exc:
         print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
         await play_next_track(guild)
@@ -570,7 +582,7 @@ async def play_next_track(guild: discord.Guild):
             "Chrome/131.0.0.0 Safari/537.36' "
             "-headers 'Referer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com\r\n'"
         ),
-        options="-vn -loglevel warning -af aresample=async=1:min_hard_comp=0.100:first_pts=0",
+        options="-vn -loglevel warning",
     )
 
     def _after_playback(play_error: Exception | None):
