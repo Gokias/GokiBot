@@ -717,10 +717,6 @@ def build_ffmpeg_before_options(source_url: str) -> str:
         "-reconnect 1",
         "-reconnect_streamed 1",
         "-reconnect_delay_max 5",
-        "-fflags +genpts+nobuffer",
-        "-flags low_delay",
-        "-analyzeduration 0",
-        "-probesize 32k",
         f"-user_agent '{YOUTUBE_REQUEST_USER_AGENT}'",
     ]
     if is_youtube_url(source_url):
@@ -795,7 +791,7 @@ async def play_next_track(guild: discord.Guild, retry_track: QueueTrack | None =
         ffmpeg_source = discord.FFmpegPCMAudio(
             stream_url,
             before_options=build_ffmpeg_before_options(next_track.source_url),
-            options="-vn -loglevel warning -af aresample=async=1:first_pts=0",
+            options="-vn -loglevel warning",
         )
         print(f"[music] voice_client.play start track='{next_track.title}'")
         voice_client.play(ffmpeg_source, after=_queue_follow_up)
