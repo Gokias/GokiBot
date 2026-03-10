@@ -77,7 +77,10 @@ AI_CONTEXT_MESSAGE_LIMIT = 10
 AI_CONTEXT_HISTORY_SCAN_LIMIT = 30
 AI_COOLDOWN_SECONDS = 30
 AI_MAX_OUTPUT_TOKENS = 220
+AI_RETRY_MAX_OUTPUT_TOKENS = 600
 AI_MAX_REPLY_CHARS = 1800
+AI_REASONING_EFFORT = "none"
+AI_TEXT_VERBOSITY = "low"
 AI_SYSTEM_PROMPT = (
     "You are PoopBot. Unless the user asks for more detail, answer directly and briefly. "
     "Prefer short, efficient replies over long explanations. "
@@ -100,6 +103,10 @@ class AIConfigurationError(RuntimeError):
 
 
 class AIEmptyResponseError(RuntimeError):
+    pass
+
+
+class AIIncompleteResponseError(RuntimeError):
     pass
 
 WESROTH_HANDLE_URL = "https://www.youtube.com/@WesRoth"
@@ -411,17 +418,59 @@ async def request_ai_reply(conversation_prompt: str) -> str:
             reason = f"openai package unavailable: {OPENAI_IMPORT_ERROR}"
         raise AIConfigurationError(f"AI replies are not configured: {reason}")
 
-    response = await client.responses.create(
-        model=OPENAI_MODEL,
-        instructions=AI_SYSTEM_PROMPT,
-        input=conversation_prompt,
-        max_output_tokens=AI_MAX_OUTPUT_TOKENS,
-    )
+    async def _create_response(max_output_tokens: int):
+        return await client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=AI_SYSTEM_PROMPT,
+            input=conversation_prompt,
+            max_output_tokens=max_output_tokens,
+            reasoning={"effort": AI_REASONING_EFFORT},
+            text={"verbosity": AI_TEXT_VERBOSITY},
+        )
 
-    reply_text = trim_ai_reply(getattr(response, "output_text", "") or "")
-    if not reply_text:
-        raise AIEmptyResponseError("AI response was empty.")
-    return reply_text
+    def _extract_response_text(response) -> str:
+        direct_text = trim_ai_reply(getattr(response, "output_text", "") or "")
+        if direct_text:
+            return direct_text
+
+        content_parts = []
+        for item in getattr(response, "output", None) or []:
+            if getattr(item, "type", None) != "message":
+                continue
+            for part in getattr(item, "content", None) or []:
+                if getattr(part, "type", None) != "output_text":
+                    continue
+                text = trim_ai_reply(getattr(part, "text", "") or "")
+                if text:
+                    content_parts.append(text)
+
+        return "\n".join(content_parts).strip()
+
+    response = await _create_response(AI_MAX_OUTPUT_TOKENS)
+    reply_text = _extract_response_text(response)
+    status = getattr(response, "status", None)
+    incomplete_details = getattr(response, "incomplete_details", None)
+    incomplete_reason = getattr(incomplete_details, "reason", None)
+
+    if (
+        status == "incomplete"
+        and incomplete_reason == "max_output_tokens"
+        and not reply_text
+        and AI_RETRY_MAX_OUTPUT_TOKENS > AI_MAX_OUTPUT_TOKENS
+    ):
+        response = await _create_response(AI_RETRY_MAX_OUTPUT_TOKENS)
+        reply_text = _extract_response_text(response)
+        status = getattr(response, "status", None)
+        incomplete_details = getattr(response, "incomplete_details", None)
+        incomplete_reason = getattr(incomplete_details, "reason", None)
+
+    if reply_text:
+        return reply_text
+    if status == "incomplete":
+        raise AIIncompleteResponseError(
+            f"AI response incomplete with reason={incomplete_reason or 'unknown'}."
+        )
+    raise AIEmptyResponseError("AI response was empty.")
 
 
 async def send_message_reply(message: discord.Message, text: str):
@@ -466,6 +515,10 @@ async def handle_ai_mention(message: discord.Message, bot_user_id: int) -> bool:
         except AIEmptyResponseError as exc:
             print(f"[ai] request empty user={message.author.id} reason={exc}")
             await send_message_reply(message, AI_EMPTY_RESPONSE_MESSAGE)
+            return True
+        except AIIncompleteResponseError as exc:
+            print(f"[ai] request incomplete user={message.author.id} reason={exc}")
+            await send_message_reply(message, AI_ERROR_MESSAGE)
             return True
         except RateLimitError as exc:
             elapsed = time.perf_counter() - started_at

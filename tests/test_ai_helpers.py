@@ -64,7 +64,7 @@ class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
         class FakeResponses:
             async def create(self, **kwargs):
                 captured.update(kwargs)
-                return types.SimpleNamespace(output_text="Short answer")
+                return types.SimpleNamespace(output_text="Short answer", status="completed", output=[])
 
         poopbot.ai_client = types.SimpleNamespace(responses=FakeResponses())
 
@@ -75,6 +75,31 @@ class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["instructions"], poopbot.AI_SYSTEM_PROMPT)
         self.assertEqual(captured["input"], "Alice: hi")
         self.assertEqual(captured["max_output_tokens"], poopbot.AI_MAX_OUTPUT_TOKENS)
+        self.assertEqual(captured["reasoning"], {"effort": poopbot.AI_REASONING_EFFORT})
+        self.assertEqual(captured["text"], {"verbosity": poopbot.AI_TEXT_VERBOSITY})
+
+    async def test_request_ai_reply_retries_when_first_response_hits_max_output_tokens(self):
+        calls = []
+
+        class FakeResponses:
+            async def create(self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    return types.SimpleNamespace(
+                        output_text="",
+                        status="incomplete",
+                        incomplete_details=types.SimpleNamespace(reason="max_output_tokens"),
+                        output=[],
+                    )
+                return types.SimpleNamespace(output_text="Retried answer", status="completed", output=[])
+
+        poopbot.ai_client = types.SimpleNamespace(responses=FakeResponses())
+
+        reply = await poopbot.request_ai_reply("Alice: hi")
+
+        self.assertEqual(reply, "Retried answer")
+        self.assertEqual(calls[0]["max_output_tokens"], poopbot.AI_MAX_OUTPUT_TOKENS)
+        self.assertEqual(calls[1]["max_output_tokens"], poopbot.AI_RETRY_MAX_OUTPUT_TOKENS)
 
     async def test_handle_ai_mention_returns_fallback_message_on_api_error(self):
         class FakeResponses:
