@@ -83,7 +83,7 @@ FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
     "Timed out while fetching track info for that link or search. Please try again in a moment."
 )
 
-YTDLP_AUDIO_FORMAT = "bestaudio/best"
+YTDLP_AUDIO_FORMAT = "bestaudio[acodec=opus]/bestaudio/best"
 YOUTUBE_HOSTS = {
     "youtube.com",
     "www.youtube.com",
@@ -280,8 +280,9 @@ class QueueTrack:
     duration_seconds: int
     requested_by: int
     stream_url: str | None = None
+    audio_codec: str | None = None
     stream_url_refresh_attempts: int = 0
-    stream_url_task: asyncio.Task[str] | None = field(default=None, init=False, repr=False, compare=False)
+    stream_url_task: asyncio.Task["StreamSelection"] | None = field(default=None, init=False, repr=False, compare=False)
 
 
 class GuildMusicState:
@@ -497,10 +498,24 @@ def extract_webpage_url(info: dict[str, object], source: str) -> str:
     return source
 
 
-def extract_stream_url(info: dict[str, object]) -> str:
+def normalize_codec_name(value: object) -> str | None:
+    codec = str(value or "").strip().lower()
+    if not codec or codec == "none":
+        return None
+    return codec
+
+
+@dataclass(frozen=True)
+class StreamSelection:
+    url: str
+    audio_codec: str | None = None
+
+
+def extract_stream_selection(info: dict[str, object]) -> StreamSelection:
     direct_url = str(info.get("url") or "").strip()
     direct_vcodec = str(info.get("vcodec") or "").lower()
     direct_url_is_audio_only = direct_vcodec == "none"
+    direct_audio_codec = normalize_codec_name(info.get("acodec"))
 
     requested_formats = info.get("requested_formats")
     if isinstance(requested_formats, list):
@@ -511,15 +526,15 @@ def extract_stream_url(info: dict[str, object]) -> str:
             if not is_http_url(format_url):
                 continue
             if str(fmt.get("vcodec") or "") == "none":
-                return format_url
+                return StreamSelection(format_url, normalize_codec_name(fmt.get("acodec")))
 
     formats = info.get("formats")
     if direct_url_is_audio_only and is_http_url(direct_url):
-        return direct_url
+        return StreamSelection(direct_url, direct_audio_codec)
 
     if not isinstance(formats, list):
         if is_http_url(direct_url):
-            return direct_url
+            return StreamSelection(direct_url, direct_audio_codec)
         raise RuntimeError("yt-dlp did not provide an audio stream URL.")
 
     def _is_hls_protocol(fmt: dict[str, object]) -> bool:
@@ -528,22 +543,29 @@ def extract_stream_url(info: dict[str, object]) -> str:
 
     best_audio_url = ""
     best_audio_score = -1.0
+    best_audio_codec: str | None = None
     best_hls_audio_url = ""
     best_hls_audio_score = -1.0
+    best_hls_audio_codec: str | None = None
     fallback_url = ""
+    fallback_codec: str | None = None
     fallback_non_hls_url = ""
+    fallback_non_hls_codec: str | None = None
     for fmt in formats:
         if not isinstance(fmt, dict):
             continue
         format_url = str(fmt.get("url") or "").strip()
         if not is_http_url(format_url):
             continue
+        format_codec = normalize_codec_name(fmt.get("acodec"))
         if not fallback_url:
             fallback_url = format_url
+            fallback_codec = format_codec
 
         is_hls = _is_hls_protocol(fmt)
         if not is_hls and not fallback_non_hls_url:
             fallback_non_hls_url = format_url
+            fallback_non_hls_codec = format_codec
 
         is_audio_only = str(fmt.get("vcodec") or "") == "none"
         if not is_audio_only:
@@ -559,20 +581,26 @@ def extract_stream_url(info: dict[str, object]) -> str:
             if score >= best_hls_audio_score:
                 best_hls_audio_score = score
                 best_hls_audio_url = format_url
+                best_hls_audio_codec = format_codec
         else:
             if score >= best_audio_score:
                 best_audio_score = score
                 best_audio_url = format_url
+                best_audio_codec = format_codec
 
     if best_audio_url:
-        return best_audio_url
+        return StreamSelection(best_audio_url, best_audio_codec)
     if fallback_non_hls_url:
-        return fallback_non_hls_url
+        return StreamSelection(fallback_non_hls_url, fallback_non_hls_codec)
     if best_hls_audio_url:
-        return best_hls_audio_url
+        return StreamSelection(best_hls_audio_url, best_hls_audio_codec)
     if fallback_url:
-        return fallback_url
+        return StreamSelection(fallback_url, fallback_codec)
     raise RuntimeError("yt-dlp returned an empty stream URL.")
+
+
+def extract_stream_url(info: dict[str, object]) -> str:
+    return extract_stream_selection(info).url
 
 
 def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTrack]:
@@ -590,8 +618,11 @@ def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTr
 
             webpage_url = extract_webpage_url(entry, source)
             stream_url: str | None = None
+            audio_codec: str | None = None
             try:
-                stream_url = extract_stream_url(entry)
+                stream = extract_stream_selection(entry)
+                stream_url = stream.url
+                audio_codec = stream.audio_codec
             except RuntimeError:
                 stream_url = None
 
@@ -602,6 +633,7 @@ def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTr
                     duration_seconds=duration_seconds,
                     requested_by=0,
                     stream_url=stream_url,
+                    audio_codec=audio_codec,
                 )
             )
 
@@ -620,8 +652,11 @@ def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTr
     webpage_url = extract_webpage_url(track_info, source)
 
     stream_url: str | None = None
+    audio_codec: str | None = None
     try:
-        stream_url = extract_stream_url(track_info)
+        stream = extract_stream_selection(track_info)
+        stream_url = stream.url
+        audio_codec = stream.audio_codec
     except RuntimeError:
         stream_url = None
 
@@ -632,6 +667,7 @@ def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTr
             duration_seconds=duration_seconds,
             requested_by=0,
             stream_url=stream_url,
+            audio_codec=audio_codec,
         )
     ]
 
@@ -644,9 +680,9 @@ async def resolve_first_track(source: str) -> QueueTrack:
     return tracks[0]
 
 
-async def resolve_stream_url(source_url: str) -> str:
+async def resolve_stream_selection(source_url: str) -> StreamSelection:
     info = await extract_info(source_url, noplaylist=True)
-    return extract_stream_url(pick_track_info(info))
+    return extract_stream_selection(pick_track_info(info))
 
 
 async def ensure_track_stream_url(track: QueueTrack) -> str:
@@ -655,20 +691,21 @@ async def ensure_track_stream_url(track: QueueTrack) -> str:
 
     task = track.stream_url_task
     if task is None or task.done():
-        task = asyncio.create_task(resolve_stream_url(track.source_url))
+        task = asyncio.create_task(resolve_stream_selection(track.source_url))
         track.stream_url_task = task
 
     try:
-        stream_url = await task
+        stream = await task
     except Exception:
         if track.stream_url_task is task:
             track.stream_url_task = None
         raise
 
-    track.stream_url = stream_url
+    track.stream_url = stream.url
+    track.audio_codec = stream.audio_codec
     if track.stream_url_task is task:
         track.stream_url_task = None
-    return stream_url
+    return stream.url
 
 
 async def expand_remaining_playlist(guild_id: int, source: str, requested_by: int):
@@ -722,6 +759,21 @@ def build_ffmpeg_before_options(source_url: str) -> str:
     if is_youtube_url(source_url):
         parts.append(f"-headers '{YOUTUBE_REQUEST_HEADERS}'")
     return " ".join(parts)
+
+
+def should_copy_opus(track: QueueTrack) -> bool:
+    codec = (track.audio_codec or "").lower()
+    return "opus" in codec
+
+
+def build_discord_audio_source(track: QueueTrack, stream_url: str) -> discord.AudioSource:
+    codec = "copy" if should_copy_opus(track) else "libopus"
+    return discord.FFmpegOpusAudio(
+        stream_url,
+        codec=codec,
+        before_options=build_ffmpeg_before_options(track.source_url),
+        options="-vn",
+    )
 
 
 async def play_next_track(guild: discord.Guild, retry_track: QueueTrack | None = None):
@@ -788,11 +840,7 @@ async def play_next_track(guild: discord.Guild, retry_track: QueueTrack | None =
             print(f"Failed to start next track: {exc}")
 
     try:
-        ffmpeg_source = discord.FFmpegPCMAudio(
-            stream_url,
-            before_options=build_ffmpeg_before_options(next_track.source_url),
-            options="-vn -loglevel warning",
-        )
+        ffmpeg_source = build_discord_audio_source(next_track, stream_url)
         print(f"[music] voice_client.play start track='{next_track.title}'")
         voice_client.play(ffmpeg_source, after=_queue_follow_up)
     except Exception as exc:

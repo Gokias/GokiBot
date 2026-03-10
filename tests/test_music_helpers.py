@@ -33,6 +33,8 @@ class MusicHelperTests(unittest.TestCase):
                     "duration": 187,
                     "webpage_url": "https://www.youtube.com/watch?v=abc123",
                     "url": "https://stream.example/audio.webm",
+                    "vcodec": "none",
+                    "acodec": "opus",
                     "extractor_key": "Youtube",
                 }
             ]
@@ -43,6 +45,7 @@ class MusicHelperTests(unittest.TestCase):
         self.assertEqual(len(tracks), 1)
         self.assertEqual(tracks[0].source_url, "https://www.youtube.com/watch?v=abc123")
         self.assertEqual(tracks[0].stream_url, "https://stream.example/audio.webm")
+        self.assertEqual(tracks[0].audio_codec, "opus")
 
     def test_parse_tracks_from_flat_playlist_entry_uses_watch_url(self):
         info = {
@@ -64,6 +67,7 @@ class MusicHelperTests(unittest.TestCase):
         self.assertEqual(len(tracks), 1)
         self.assertEqual(tracks[0].source_url, "https://www.youtube.com/watch?v=abc123")
         self.assertIsNone(tracks[0].stream_url)
+        self.assertIsNone(tracks[0].audio_codec)
 
 
 if __name__ == "__main__":
