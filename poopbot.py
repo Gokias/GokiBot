@@ -23,6 +23,21 @@ from yt_dlp.utils import DownloadError
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+try:
+    from openai import APIConnectionError, APIError, AsyncOpenAI, RateLimitError
+    OPENAI_IMPORT_ERROR = None
+except ImportError as exc:
+    AsyncOpenAI = None
+    OPENAI_IMPORT_ERROR = exc
+
+    class APIError(Exception):
+        pass
+
+    class APIConnectionError(Exception):
+        pass
+
+    class RateLimitError(Exception):
+        pass
 
 try:
     from zoneinfo import ZoneInfo
@@ -50,12 +65,37 @@ CLEANUP_CHANNEL_ID = 1419130398683959398
 # Ticketing configuration
 TICKET_DEV_USER_ID = os.getenv("TICKET_DEV_USER_ID")
 TICKET_ARCHIVE_CHANNEL_ID = os.getenv("TICKET_ARCHIVE_CHANNEL_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip() or "gpt-5-mini"
 
 # Daily post time (12:00am Pacific)
 TZ_NAME = "America/Los_Angeles"
 
 # Rotate button message every N poops per guild
 ROTATE_EVERY = 10
+AI_CONTEXT_MESSAGE_LIMIT = 10
+AI_CONTEXT_HISTORY_SCAN_LIMIT = 30
+AI_COOLDOWN_SECONDS = 30
+AI_MAX_OUTPUT_TOKENS = 220
+AI_MAX_REPLY_CHARS = 1800
+AI_SYSTEM_PROMPT = (
+    "You are PoopBot, a concise Discord bot. Answer the latest user message clearly and briefly. "
+    "Use recent channel context only when it helps. Do not claim to have tools, filesystem access, "
+    "or code execution. If you are unsure, say so."
+)
+AI_NOT_CONFIGURED_MESSAGE = "AI replies are not configured yet."
+AI_COOLDOWN_MESSAGE = "Give me a few seconds before asking again."
+AI_RATE_LIMIT_MESSAGE = "I’m a little busy right now. Try again in a moment."
+AI_ERROR_MESSAGE = "I hit an error trying to answer that. Try again in a moment."
+AI_EMPTY_RESPONSE_MESSAGE = "I don't have a reply for that yet."
+
+
+class AIConfigurationError(RuntimeError):
+    pass
+
+
+class AIEmptyResponseError(RuntimeError):
+    pass
 
 WESROTH_HANDLE_URL = "https://www.youtube.com/@WesRoth"
 WESROTH_CHANNEL_ID = os.getenv("WESROTH_CHANNEL_ID")
@@ -259,6 +299,191 @@ def current_year_local() -> int:
     return datetime.now(LOCAL_TZ).year
 
 
+def build_bot_mention_regex(bot_user_id: int) -> re.Pattern:
+    return re.compile(rf"<@!?{bot_user_id}>")
+
+
+def message_mentions_bot_content(content: str, bot_user_id: int) -> bool:
+    return bool(build_bot_mention_regex(bot_user_id).search(content))
+
+
+def extract_bot_mention_prompt(content: str, bot_user_id: int) -> str:
+    without_mentions = build_bot_mention_regex(bot_user_id).sub(" ", content)
+    return re.sub(r"\s+", " ", without_mentions).strip()
+
+
+def normalize_ai_context_content(content: str) -> str:
+    return content.strip()
+
+
+def select_ai_context_entries(history_messages, limit: int = AI_CONTEXT_MESSAGE_LIMIT) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for history_message in history_messages:
+        if getattr(history_message, "webhook_id", None) is not None:
+            continue
+
+        content = normalize_ai_context_content(getattr(history_message, "content", ""))
+        if not content:
+            continue
+
+        author = getattr(history_message, "author", None)
+        author_name = getattr(author, "display_name", str(author) if author is not None else "Unknown")
+        entries.append((author_name, content))
+        if len(entries) >= limit:
+            break
+
+    entries.reverse()
+    return entries
+
+
+async def fetch_ai_context_entries(message: discord.Message) -> list[tuple[str, str]]:
+    history_messages = []
+    async for previous_message in message.channel.history(
+        limit=AI_CONTEXT_HISTORY_SCAN_LIMIT,
+        before=message,
+        oldest_first=False,
+    ):
+        history_messages.append(previous_message)
+
+    return select_ai_context_entries(history_messages)
+
+
+def build_ai_conversation_prompt(
+    context_entries: list[tuple[str, str]],
+    current_author_name: str,
+    current_prompt: str,
+) -> str:
+    lines = ["Recent Discord conversation from the same channel:"]
+    for author_name, content in context_entries:
+        lines.append(f"{author_name}: {content}")
+    lines.append(f"{current_author_name}: {current_prompt}")
+    lines.append("")
+    lines.append("Reply to the latest message only.")
+    return "\n".join(lines)
+
+
+def trim_ai_reply(text: str, max_chars: int = AI_MAX_REPLY_CHARS) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def get_ai_cooldown_remaining(user_id: int, now: float | None = None) -> float:
+    last_used = ai_cooldowns.get(user_id)
+    if last_used is None:
+        return 0.0
+
+    current_time = time.monotonic() if now is None else now
+    remaining = AI_COOLDOWN_SECONDS - (current_time - last_used)
+    if remaining <= 0:
+        ai_cooldowns.pop(user_id, None)
+        return 0.0
+    return remaining
+
+
+def mark_ai_cooldown(user_id: int, now: float | None = None):
+    ai_cooldowns[user_id] = time.monotonic() if now is None else now
+
+
+def get_openai_client():
+    global ai_client
+
+    if ai_client is not None:
+        return ai_client
+    if not OPENAI_API_KEY or AsyncOpenAI is None:
+        return None
+
+    ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    return ai_client
+
+
+async def request_ai_reply(conversation_prompt: str) -> str:
+    client = get_openai_client()
+    if client is None:
+        reason = "missing OPENAI_API_KEY"
+        if AsyncOpenAI is None and OPENAI_IMPORT_ERROR is not None:
+            reason = f"openai package unavailable: {OPENAI_IMPORT_ERROR}"
+        raise AIConfigurationError(f"AI replies are not configured: {reason}")
+
+    response = await client.responses.create(
+        model=OPENAI_MODEL,
+        instructions=AI_SYSTEM_PROMPT,
+        input=conversation_prompt,
+        max_output_tokens=AI_MAX_OUTPUT_TOKENS,
+    )
+
+    reply_text = trim_ai_reply(getattr(response, "output_text", "") or "")
+    if not reply_text:
+        raise AIEmptyResponseError("AI response was empty.")
+    return reply_text
+
+
+async def send_message_reply(message: discord.Message, text: str):
+    await message.reply(
+        text,
+        mention_author=False,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def handle_ai_mention(message: discord.Message, bot_user_id: int) -> bool:
+    prompt = extract_bot_mention_prompt(message.content, bot_user_id)
+    if not prompt:
+        return False
+
+    cooldown_remaining = get_ai_cooldown_remaining(message.author.id)
+    if cooldown_remaining > 0:
+        await send_message_reply(message, AI_COOLDOWN_MESSAGE)
+        return True
+
+    context_entries = await fetch_ai_context_entries(message)
+    conversation_prompt = build_ai_conversation_prompt(
+        context_entries,
+        message.author.display_name,
+        prompt,
+    )
+
+    mark_ai_cooldown(message.author.id)
+    started_at = time.perf_counter()
+    print(
+        f"[ai] request start user={message.author.id} "
+        f"channel={message.channel.id} model={OPENAI_MODEL}"
+    )
+
+    async with message.channel.typing():
+        try:
+            reply_text = await request_ai_reply(conversation_prompt)
+        except AIConfigurationError as exc:
+            print(f"[ai] request skipped user={message.author.id} reason={exc}")
+            await send_message_reply(message, AI_NOT_CONFIGURED_MESSAGE)
+            return True
+        except AIEmptyResponseError as exc:
+            print(f"[ai] request empty user={message.author.id} reason={exc}")
+            await send_message_reply(message, AI_EMPTY_RESPONSE_MESSAGE)
+            return True
+        except RateLimitError as exc:
+            elapsed = time.perf_counter() - started_at
+            print(f"[ai] request rate_limited user={message.author.id} elapsed={elapsed:.2f}s error={exc}")
+            await send_message_reply(message, AI_RATE_LIMIT_MESSAGE)
+            return True
+        except (APIConnectionError, APIError) as exc:
+            elapsed = time.perf_counter() - started_at
+            print(f"[ai] request failed user={message.author.id} elapsed={elapsed:.2f}s error={exc}")
+            await send_message_reply(message, AI_ERROR_MESSAGE)
+            return True
+        except Exception as exc:
+            elapsed = time.perf_counter() - started_at
+            print(f"[ai] request unexpected_error user={message.author.id} elapsed={elapsed:.2f}s error={exc}")
+            await send_message_reply(message, AI_ERROR_MESSAGE)
+            return True
+
+    elapsed = time.perf_counter() - started_at
+    print(f"[ai] request ok user={message.author.id} elapsed={elapsed:.2f}s")
+    await send_message_reply(message, reply_text)
+    return True
+
+
 # =========================
 # DISCORD SETUP
 # =========================
@@ -270,6 +495,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # serialize DB writes to avoid sqlite "database is locked"
 db_write_lock = asyncio.Lock()
+ai_client = None
+ai_cooldowns: dict[int, float] = {}
 
 
 
@@ -1481,8 +1708,11 @@ async def wesroth_upload_watch():
 # =========================
 @bot.event
 async def on_message(message: discord.Message):
+    if message.author.bot or message.webhook_id is not None:
+        return
+
     # delete any non-bot message in the cleanup channel
-    if message.channel.id == CLEANUP_CHANNEL_ID and not message.author.bot:
+    if message.channel.id == CLEANUP_CHANNEL_ID:
         try:
             await log_cleanup_message(message)
             await message.delete()
@@ -1490,6 +1720,14 @@ async def on_message(message: discord.Message):
             pass
         # still allow commands processing elsewhere; this message is gone anyway
         return
+
+    if (
+        message.guild is not None
+        and bot.user is not None
+        and message.content
+        and message_mentions_bot_content(message.content, bot.user.id)
+    ):
+        await handle_ai_mention(message, bot.user.id)
 
     await bot.process_commands(message)
 
