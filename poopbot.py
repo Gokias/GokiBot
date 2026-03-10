@@ -11,9 +11,14 @@ from urllib.parse import urlparse
 import json
 import xml.etree.ElementTree as ET
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, date, time as dtime
+from functools import partial
 import time
+from urllib.parse import parse_qs
+
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 import discord
 from discord import app_commands
@@ -31,8 +36,6 @@ except ImportError:
 load_dotenv()  # loads variables from .env into the process environment
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN not found. Check your .env file and WorkingDirectory.")
 
 DB_DIR = "db"
 CONFIG_DB_PATH = os.path.join(DB_DIR, "poopbot_config.db")
@@ -77,7 +80,25 @@ WESROTH_CAPTIONS = [
 
 FETCH_TRACK_INFO_TIMEOUT_SECONDS = 25
 FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
-    "Timed out while fetching track info from YouTube. Please try again in a moment."
+    "Timed out while fetching track info for that link or search. Please try again in a moment."
+)
+
+YTDLP_AUDIO_FORMAT = "bestaudio/best"
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+}
+YOUTUBE_REQUEST_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+YOUTUBE_REQUEST_HEADERS = (
+    "Referer: https://www.youtube.com/\r\n"
+    "Origin: https://www.youtube.com\r\n"
 )
 
 # =========================
@@ -259,6 +280,8 @@ class QueueTrack:
     duration_seconds: int
     requested_by: int
     stream_url: str | None = None
+    stream_url_refresh_attempts: int = 0
+    stream_url_task: asyncio.Task[str] | None = field(default=None, init=False, repr=False, compare=False)
 
 
 class GuildMusicState:
@@ -329,9 +352,154 @@ def pick_track_info(info: dict[str, object]) -> dict[str, object]:
     return info
 
 
+def is_http_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def is_youtube_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    return (parsed.hostname or "").lower() in YOUTUBE_HOSTS
+
+
+def is_youtube_result(info: dict[str, object], source: str) -> bool:
+    if source.startswith("ytsearch") or is_youtube_url(source):
+        return True
+
+    for key in ("extractor", "extractor_key", "ie_key", "webpage_url_domain"):
+        value = str(info.get(key) or "").lower()
+        if "youtube" in value:
+            return True
+
+    return False
+
+
+def is_playlist_url(value: str) -> bool:
+    if not is_http_url(value):
+        return False
+
+    parsed = urlparse(value)
+    query = parse_qs(parsed.query)
+    if query.get("list"):
+        return True
+
+    return parsed.path.rstrip("/").endswith("/playlist")
+
+
+def normalize_audio_source(value: str) -> str:
+    source = value.strip()
+    if not source:
+        return ""
+    if is_http_url(source):
+        return source
+    return f"ytsearch1:{source}"
+
+
+def build_ytdlp_options(
+    *,
+    playlist_items: str | None = None,
+    noplaylist: bool = False,
+    extract_flat: str | bool | None = None,
+) -> dict[str, object]:
+    options: dict[str, object] = {
+        "format": YTDLP_AUDIO_FORMAT,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "skip_download": True,
+        "extractor_retries": 3,
+        "socket_timeout": 15,
+    }
+    if playlist_items is not None:
+        options["playlist_items"] = playlist_items
+    if noplaylist:
+        options["noplaylist"] = True
+    if extract_flat is not None:
+        options["extract_flat"] = extract_flat
+    return options
+
+
+def _format_ytdlp_error(exc: Exception) -> str:
+    message = str(exc).strip()
+    if message.startswith("ERROR:"):
+        message = message[6:].strip()
+    return message or "yt-dlp failed"
+
+
+def extract_info_sync(
+    source: str,
+    *,
+    playlist_items: str | None = None,
+    noplaylist: bool = False,
+    extract_flat: str | bool | None = None,
+) -> dict[str, object]:
+    options = build_ytdlp_options(
+        playlist_items=playlist_items,
+        noplaylist=noplaylist,
+        extract_flat=extract_flat,
+    )
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(source, download=False)
+    except DownloadError as exc:
+        raise RuntimeError(_format_ytdlp_error(exc)) from exc
+    except Exception as exc:
+        raise RuntimeError(_format_ytdlp_error(exc)) from exc
+
+    if not isinstance(info, dict):
+        raise RuntimeError("Unable to read track metadata.")
+    return info
+
+
+async def extract_info(
+    source: str,
+    *,
+    playlist_items: str | None = None,
+    noplaylist: bool = False,
+    extract_flat: str | bool | None = None,
+) -> dict[str, object]:
+    return await asyncio.to_thread(
+        partial(
+            extract_info_sync,
+            source,
+            playlist_items=playlist_items,
+            noplaylist=noplaylist,
+            extract_flat=extract_flat,
+        )
+    )
+
+
+def extract_webpage_url(info: dict[str, object], source: str) -> str:
+    for key in ("webpage_url", "original_url"):
+        candidate = str(info.get(key) or "").strip()
+        if is_http_url(candidate):
+            return candidate
+
+    raw_url = str(info.get("url") or "").strip()
+    if is_http_url(raw_url):
+        return raw_url
+
+    entry_id = raw_url or str(info.get("id") or "").strip()
+    if entry_id and is_youtube_result(info, source):
+        return f"https://www.youtube.com/watch?v={entry_id}"
+
+    return source
+
+
 def extract_stream_url(info: dict[str, object]) -> str:
     direct_url = str(info.get("url") or "").strip()
-    if direct_url:
+    if is_http_url(direct_url):
         return direct_url
 
     requested_formats = info.get("requested_formats")
@@ -340,7 +508,7 @@ def extract_stream_url(info: dict[str, object]) -> str:
             if not isinstance(fmt, dict):
                 continue
             format_url = str(fmt.get("url") or "").strip()
-            if not format_url:
+            if not is_http_url(format_url):
                 continue
             if str(fmt.get("vcodec") or "") == "none":
                 return format_url
@@ -363,7 +531,7 @@ def extract_stream_url(info: dict[str, object]) -> str:
         if not isinstance(fmt, dict):
             continue
         format_url = str(fmt.get("url") or "").strip()
-        if not format_url:
+        if not is_http_url(format_url):
             continue
         if not fallback_url:
             fallback_url = format_url
@@ -415,13 +583,12 @@ def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTr
             if duration_seconds <= 0:
                 duration_seconds = parse_duration_seconds(entry.get("duration_string"))
 
-            webpage_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
-            if not webpage_url:
-                entry_id = str(entry.get("id") or "").strip()
-                if entry_id:
-                    webpage_url = f"https://www.youtube.com/watch?v={entry_id}"
-                else:
-                    webpage_url = source
+            webpage_url = extract_webpage_url(entry, source)
+            stream_url: str | None = None
+            try:
+                stream_url = extract_stream_url(entry)
+            except RuntimeError:
+                stream_url = None
 
             tracks.append(
                 QueueTrack(
@@ -429,7 +596,7 @@ def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTr
                     source_url=webpage_url,
                     duration_seconds=duration_seconds,
                     requested_by=0,
-                    stream_url=None,
+                    stream_url=stream_url,
                 )
             )
 
@@ -445,7 +612,7 @@ def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTr
     if duration_seconds <= 0:
         duration_seconds = parse_duration_seconds(info.get("duration_string"))
 
-    webpage_url = str(track_info.get("webpage_url") or info.get("webpage_url") or source)
+    webpage_url = extract_webpage_url(track_info, source)
 
     stream_url: str | None = None
     try:
@@ -464,72 +631,68 @@ def parse_tracks_from_info(info: dict[str, object], source: str) -> list[QueueTr
     ]
 
 
-async def fetch_tracks(source: str) -> list[QueueTrack]:
-    info_proc = await asyncio.create_subprocess_exec(
-        "yt-dlp",
-        "-f",
-        "bestaudio/best",
-        "--dump-single-json",
-        source,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    info_stdout, info_stderr = await info_proc.communicate()
-    if info_proc.returncode != 0:
-        err = info_stderr.decode("utf-8", errors="ignore").strip() or "yt-dlp failed"
-        raise RuntimeError(err)
-
-    try:
-        info = json.loads(info_stdout.decode("utf-8", errors="ignore"))
-    except Exception as exc:
-        raise RuntimeError("Unable to read track metadata.") from exc
-
-    return parse_tracks_from_info(info, source)
+async def resolve_first_track(source: str) -> QueueTrack:
+    info = await extract_info(source, playlist_items="1")
+    tracks = parse_tracks_from_info(info, source)
+    if not tracks:
+        raise RuntimeError("No playable track found for that query.")
+    return tracks[0]
 
 
 async def resolve_stream_url(source_url: str) -> str:
-    stream_proc = await asyncio.create_subprocess_exec(
-        "yt-dlp",
-        "-f",
-        "bestaudio/best",
-        "--dump-single-json",
-        "--no-playlist",
-        source_url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stream_stdout, stream_stderr = await stream_proc.communicate()
-    if stream_proc.returncode != 0:
-        err = stream_stderr.decode("utf-8", errors="ignore").strip() or "yt-dlp failed"
-        raise RuntimeError(err)
-
-    try:
-        info = json.loads(stream_stdout.decode("utf-8", errors="ignore"))
-    except Exception as exc:
-        raise RuntimeError("Unable to read playback stream URL.") from exc
-
+    info = await extract_info(source_url, noplaylist=True)
     return extract_stream_url(pick_track_info(info))
 
 
-def is_youtube_url(value: str) -> bool:
+async def ensure_track_stream_url(track: QueueTrack) -> str:
+    if track.stream_url:
+        return track.stream_url
+
+    task = track.stream_url_task
+    if task is None or task.done():
+        task = asyncio.create_task(resolve_stream_url(track.source_url))
+        track.stream_url_task = task
+
     try:
-        parsed = urlparse(value)
-    except ValueError:
-        return False
+        stream_url = await task
+    except Exception:
+        if track.stream_url_task is task:
+            track.stream_url_task = None
+        raise
 
-    if parsed.scheme not in {"http", "https"}:
-        return False
+    track.stream_url = stream_url
+    if track.stream_url_task is task:
+        track.stream_url_task = None
+    return stream_url
 
-    hostname = (parsed.hostname or "").lower()
-    youtube_hosts = {
-        "youtube.com",
-        "www.youtube.com",
-        "m.youtube.com",
-        "music.youtube.com",
-        "youtu.be",
-        "www.youtu.be",
-    }
-    return hostname in youtube_hosts
+
+async def expand_remaining_playlist(guild_id: int, source: str, requested_by: int):
+    expand_started_at = time.perf_counter()
+    try:
+        info = await asyncio.wait_for(
+            extract_info(source, playlist_items="2:", extract_flat="in_playlist"),
+            timeout=FETCH_TRACK_INFO_TIMEOUT_SECONDS,
+        )
+        log_music_timing("expand_playlist", "end", expand_started_at, guild_id=guild_id, source=source)
+    except asyncio.TimeoutError:
+        log_music_timing("expand_playlist", "timeout", expand_started_at, guild_id=guild_id, source=source)
+        return
+    except RuntimeError as exc:
+        print(f"Failed to expand playlist for guild {guild_id}: {exc}")
+        return
+
+    tracks = parse_tracks_from_info(info, source)
+    if not tracks:
+        return
+
+    for track in tracks:
+        track.requested_by = requested_by
+
+    state = get_music_state(guild_id)
+    async with state.lock:
+        state.queue.extend(tracks)
+
+    print(f"[music] expand_playlist queued count={len(tracks)} guild_id={guild_id}")
 
 
 async def ensure_voice_channel(interaction: discord.Interaction) -> discord.VoiceChannel | None:
@@ -543,7 +706,25 @@ async def ensure_voice_channel(interaction: discord.Interaction) -> discord.Voic
     return member.voice.channel
 
 
-async def play_next_track(guild: discord.Guild):
+def build_ffmpeg_before_options(source_url: str) -> str:
+    parts = [
+        "-nostdin",
+        "-reconnect 1",
+        "-reconnect_streamed 1",
+        "-reconnect_delay_max 5",
+        "-http_persistent 0",
+        "-fflags +genpts+nobuffer",
+        "-flags low_delay",
+        "-analyzeduration 0",
+        "-probesize 32k",
+        f"-user_agent '{YOUTUBE_REQUEST_USER_AGENT}'",
+    ]
+    if is_youtube_url(source_url):
+        parts.append(f"-headers '{YOUTUBE_REQUEST_HEADERS}'")
+    return " ".join(parts)
+
+
+async def play_next_track(guild: discord.Guild, retry_track: QueueTrack | None = None):
     voice_client = guild.voice_client
     if voice_client is None:
         return
@@ -553,49 +734,77 @@ async def play_next_track(guild: discord.Guild):
         if voice_client.is_playing() or voice_client.is_paused():
             return
 
-        if not state.queue:
+        if retry_track is None and not state.queue:
             state.current_track = None
             state.track_started_at = None
             await voice_client.disconnect(force=True)
             return
 
-        next_track = state.queue.popleft()
+        next_track = retry_track or state.queue.popleft()
         state.current_track = next_track
         state.track_started_at = datetime.now(timezone.utc)
 
     try:
-        if next_track.stream_url:
-            stream_url = next_track.stream_url
-        else:
-            stream_url = await resolve_stream_url(next_track.source_url)
+        used_cached_stream = next_track.stream_url is not None
+        stream_started_at = time.perf_counter()
+        stream_url = await ensure_track_stream_url(next_track)
+        log_music_timing(
+            "resolve_stream_url",
+            "end",
+            stream_started_at,
+            source=next_track.source_url,
+            cached=used_cached_stream,
+        )
     except RuntimeError as exc:
         print(f"Failed to resolve stream URL for '{next_track.title}': {exc}")
         await play_next_track(guild)
         return
 
-    ffmpeg_source = discord.FFmpegPCMAudio(
-        stream_url,
-        before_options=(
-            "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-            "-http_persistent 0 "
-            "-user_agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36' "
-            "-headers 'Referer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com\r\n'"
-        ),
-        options="-vn -loglevel warning",
-    )
+    playback_started_at = time.perf_counter()
 
-    def _after_playback(play_error: Exception | None):
+    def _queue_follow_up(play_error: Exception | None):
         if play_error:
             print(f"Playback error: {play_error}")
-        fut = asyncio.run_coroutine_threadsafe(play_next_track(guild), bot.loop)
+
+        should_retry = (
+            play_error is not None
+            and used_cached_stream
+            and next_track.stream_url_refresh_attempts == 0
+            and (time.perf_counter() - playback_started_at) < 5
+        )
+        if should_retry:
+            next_track.stream_url_refresh_attempts += 1
+            next_track.stream_url = None
+            next_track.stream_url_task = None
+            print(f"[music] retrying track with fresh stream URL track='{next_track.title}'")
+            follow_up = play_next_track(guild, retry_track=next_track)
+        else:
+            follow_up = play_next_track(guild)
+
+        fut = asyncio.run_coroutine_threadsafe(follow_up, bot.loop)
         try:
             fut.result()
         except Exception as exc:
             print(f"Failed to start next track: {exc}")
 
-    print(f"[music] voice_client.play start track='{next_track.title}'")
-    voice_client.play(ffmpeg_source, after=_after_playback)
+    try:
+        ffmpeg_source = discord.FFmpegPCMAudio(
+            stream_url,
+            before_options=build_ffmpeg_before_options(next_track.source_url),
+            options="-vn -loglevel warning -af aresample=async=1:first_pts=0",
+        )
+        print(f"[music] voice_client.play start track='{next_track.title}'")
+        voice_client.play(ffmpeg_source, after=_queue_follow_up)
+    except Exception as exc:
+        print(f"Failed to start playback for '{next_track.title}': {exc}")
+        should_retry = used_cached_stream and next_track.stream_url_refresh_attempts == 0
+        if should_retry:
+            next_track.stream_url_refresh_attempts += 1
+            next_track.stream_url = None
+            next_track.stream_url_task = None
+            await play_next_track(guild, retry_track=next_track)
+            return
+        await play_next_track(guild)
 
 
 # =========================
@@ -1647,8 +1856,8 @@ def is_dev_user(user_id: int) -> bool:
 
 
 @app_commands.guild_only()
-@bot.tree.command(name="gplay", description="Queue and play audio from a YouTube link or search term.")
-@app_commands.describe(youtube_link="A YouTube URL or search text.")
+@bot.tree.command(name="gplay", description="Queue and play audio from a link or search term.")
+@app_commands.describe(youtube_link="A media URL or search text.")
 async def gplay(interaction: discord.Interaction, youtube_link: str):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
@@ -1671,66 +1880,87 @@ async def gplay(interaction: discord.Interaction, youtube_link: str):
         )
         return
 
-    source = youtube_link.strip()
+    source = normalize_audio_source(youtube_link)
     if not source:
-        await interaction.followup.send("Please provide a YouTube link or search query.", ephemeral=True)
+        await interaction.followup.send("Please provide a media link or search query.", ephemeral=True)
         return
 
-    if not is_youtube_url(source):
-        source = f"ytsearch1:{source}"
+    is_playlist_request = is_playlist_url(source)
 
+    connected_for_request = False
+    resolve_started_at = time.perf_counter()
+    resolve_task = asyncio.create_task(
+        asyncio.wait_for(
+            resolve_first_track(source),
+            timeout=FETCH_TRACK_INFO_TIMEOUT_SECONDS,
+        )
+    )
     if interaction.guild.voice_client is None:
         try:
             await voice_channel.connect()
+            connected_for_request = True
         except discord.DiscordException as exc:
+            resolve_task.cancel()
             await interaction.followup.send(f"Could not join voice channel: {exc}", ephemeral=True)
             return
 
-    fetch_started_at = time.perf_counter()
     try:
-        tracks = await asyncio.wait_for(
-            fetch_tracks(source),
-            timeout=FETCH_TRACK_INFO_TIMEOUT_SECONDS,
-        )
-        log_music_timing("fetch_track_info", "end", fetch_started_at, source=source)
+        track = await resolve_task
+        log_music_timing("resolve_first_track", "end", resolve_started_at, source=source)
     except asyncio.TimeoutError:
-        log_music_timing("fetch_track_info", "timeout", fetch_started_at, source=source)
+        log_music_timing("resolve_first_track", "timeout", resolve_started_at, source=source)
+        if connected_for_request and interaction.guild.voice_client is not None:
+            await interaction.guild.voice_client.disconnect(force=True)
         await interaction.followup.send(FETCH_TRACK_INFO_TIMEOUT_MESSAGE, ephemeral=True)
         return
     except RuntimeError as exc:
+        if connected_for_request and interaction.guild.voice_client is not None:
+            await interaction.guild.voice_client.disconnect(force=True)
         await interaction.followup.send(f"Could not fetch audio: {exc}", ephemeral=True)
         return
 
-    for track in tracks:
-        track.requested_by = interaction.user.id
+    track.requested_by = interaction.user.id
 
     state = get_music_state(interaction.guild.id)
     async with state.lock:
+        voice_client = interaction.guild.voice_client
+        is_idle = (
+            voice_client is not None
+            and not voice_client.is_playing()
+            and not voice_client.is_paused()
+            and state.current_track is None
+            and not state.queue
+        )
         starting_queue_size = len(state.queue)
-        state.queue.extend(tracks)
+        state.queue.append(track)
         first_queue_position = starting_queue_size + 1
 
     await play_next_track(interaction.guild)
 
-    if len(tracks) == 1:
-        track = tracks[0]
+    if is_playlist_request:
+        asyncio.create_task(
+            expand_remaining_playlist(
+                interaction.guild.id,
+                source,
+                interaction.user.id,
+            )
+        )
+        action = "Starting" if is_idle and first_queue_position == 1 else "Queued"
         await interaction.followup.send(
             (
-                f"Queued **{track.title}** ({format_duration(track.duration_seconds)}). "
-                f"Position in queue: **{first_queue_position}**. [YouTube link]({track.source_url})"
+                f"{action} **{track.title}** ({format_duration(track.duration_seconds)}). "
+                f"Position in queue: **{first_queue_position}**. "
+                f"Loading the remaining playlist items in the background. [Link]({track.source_url})"
             ),
             ephemeral=True
         )
         return
 
-    total_seconds = sum(track.duration_seconds for track in tracks)
-    first_track = tracks[0]
+    action = "Starting" if is_idle and first_queue_position == 1 else "Queued"
     await interaction.followup.send(
         (
-            f"Queued **{len(tracks)}** tracks from playlist/search results "
-            f"(total {format_duration(total_seconds)}). "
-            f"First position: **{first_queue_position}**. "
-            f"Starts with: **{first_track.title}** ([YouTube link]({first_track.source_url}))."
+            f"{action} **{track.title}** ({format_duration(track.duration_seconds)}). "
+            f"Position in queue: **{first_queue_position}**. [Link]({track.source_url})"
         ),
         ephemeral=True
     )
@@ -1774,7 +2004,7 @@ async def gqueue(interaction: discord.Interaction):
             (
                 f"Now playing: **{current_track.title}** "
                 f"[{format_duration(elapsed)} / {format_duration(current_track.duration_seconds)}] "
-                f"([YouTube]({current_track.source_url}))"
+                f"([Link]({current_track.source_url}))"
             )
         )
     else:
@@ -1784,7 +2014,7 @@ async def gqueue(interaction: discord.Interaction):
         lines.append("\n**Up next:**")
         for i, track in enumerate(queued_tracks, start=1):
             lines.append(
-                f"{i}. {track.title} ({format_duration(track.duration_seconds)}) ([YouTube]({track.source_url}))"
+                f"{i}. {track.title} ({format_duration(track.duration_seconds)}) ([Link]({track.source_url}))"
             )
     else:
         lines.append("\nQueue is empty.")
@@ -1944,7 +2174,7 @@ async def gokibothelp(interaction: discord.Interaction):
         "- `/poopstats` — Show your poop stats for the year.",
         "- `/featurerequest` — Start a feature request ticket.",
         "- `/collab` — Add someone to the current ticket thread.",
-        "- `/gplay <youtube_link_or_search>` — Queue and play YouTube audio.",
+        "- `/gplay <link_or_search>` — Queue and play audio from a link or search term.",
         "- `/gqueue` — Show the current playback queue.",
         "- `/gskip` — Skip the currently playing track.",
         "- `/gokibothelp` — Show this help message."
@@ -1998,7 +2228,7 @@ async def on_ready():
     print(f"Logged in as {bot.user} (id={bot.user.id})")
 
 
-if not TOKEN or TOKEN == "PUT_TOKEN_HERE_FOR_TESTING":
-    raise RuntimeError("Set DISCORD_TOKEN_POOPBOT env var or paste token into TOKEN.")
-
-bot.run(TOKEN)
+if __name__ == "__main__":
+    if not TOKEN or TOKEN == "PUT_TOKEN_HERE_FOR_TESTING":
+        raise RuntimeError("DISCORD_TOKEN not found. Check your .env file and WorkingDirectory.")
+    bot.run(TOKEN)
