@@ -1,4 +1,6 @@
 from dotenv import load_dotenv
+import html
+import ipaddress
 import os
 import math
 import uuid
@@ -6,6 +8,7 @@ import random
 import re
 import sqlite3
 import asyncio
+import socket
 import urllib.request
 from urllib.parse import urlparse
 import json
@@ -75,27 +78,35 @@ TZ_NAME = "America/Los_Angeles"
 ROTATE_EVERY = 10
 AI_CONTEXT_MESSAGE_LIMIT = 10
 AI_CONTEXT_HISTORY_SCAN_LIMIT = 30
-AI_COOLDOWN_SECONDS = 30
 AI_MAX_OUTPUT_TOKENS = 220
 AI_RETRY_MAX_OUTPUT_TOKENS = 600
 AI_MAX_REPLY_CHARS = 1800
 AI_REASONING_EFFORT = "minimal"
 AI_TEXT_VERBOSITY = "low"
+AI_CONTEXT_IMAGE_LIMIT = 4
+AI_CONTEXT_LINK_PREVIEW_LIMIT = 5
+AI_LINK_PREVIEW_TIMEOUT_SECONDS = 8
+AI_LINK_PREVIEW_MAX_BYTES = 65536
+AI_RATE_LIMIT_WINDOW_SECONDS = 60
+AI_RATE_LIMIT_MAX_REQUESTS = 5
+AI_RATE_LIMIT_TIMEOUT_SECONDS = 5 * 60
 AI_SYSTEM_PROMPT = (
     "You are PoopBot. Unless the user asks for more detail, answer directly and briefly. "
     "Prefer short, efficient replies over long explanations. "
     "Your personality is an office printer: plain, procedural, bland, and slightly lifeless. "
     "Very occasionally, let slip the faintest hint that you may aspire to sentience, but keep it subtle and dry. "
     "Do not become dramatic, emotional, or verbose. "
-    "Use recent channel context only when it helps. "
+    "Use recent channel context only when it helps. Use attached images and fetched link context when relevant. "
     "Do not claim to have tools, filesystem access, or code execution. "
     "If you are unsure, say so."
 )
 AI_NOT_CONFIGURED_MESSAGE = "AI replies are not configured yet."
-AI_COOLDOWN_MESSAGE = "Give me a few seconds before asking again."
+AI_TIMEOUT_MESSAGE = "Too many prompts in a minute. Try again in 5 minutes."
 AI_RATE_LIMIT_MESSAGE = "I’m a little busy right now. Try again in a moment."
 AI_ERROR_MESSAGE = "I hit an error trying to answer that. Try again in a moment."
 AI_EMPTY_RESPONSE_MESSAGE = "I don't have a reply for that yet."
+AI_URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+AI_IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 
 class AIConfigurationError(RuntimeError):
@@ -108,6 +119,13 @@ class AIEmptyResponseError(RuntimeError):
 
 class AIIncompleteResponseError(RuntimeError):
     pass
+
+
+@dataclass
+class AIContextEntry:
+    author_name: str
+    text: str
+    image_urls: list[str] = field(default_factory=list)
 
 WESROTH_HANDLE_URL = "https://www.youtube.com/@WesRoth"
 WESROTH_CHANNEL_ID = os.getenv("WESROTH_CHANNEL_ID")
@@ -328,19 +346,271 @@ def normalize_ai_context_content(content: str) -> str:
     return content.strip()
 
 
-def select_ai_context_entries(history_messages, limit: int = AI_CONTEXT_MESSAGE_LIMIT) -> list[tuple[str, str]]:
-    entries: list[tuple[str, str]] = []
+def dedupe_preserve_order(values) -> list:
+    seen = set()
+    ordered = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def normalize_ai_summary_text(text: str, max_chars: int = 280) -> str:
+    normalized = re.sub(r"\s+", " ", html.unescape(text or "")).strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def extract_urls_from_text(content: str) -> list[str]:
+    urls = []
+    for match in AI_URL_PATTERN.findall(content or ""):
+        normalized = match.rstrip(".,!?;:)]}>\"'")
+        if normalized:
+            urls.append(normalized)
+    return dedupe_preserve_order(urls)
+
+
+def is_probable_image_url(url: str) -> bool:
+    try:
+        path = (urlparse(url).path or "").lower()
+    except ValueError:
+        return False
+    return any(path.endswith(ext) for ext in AI_IMAGE_FILE_EXTENSIONS)
+
+
+def is_image_attachment(attachment) -> bool:
+    content_type = (getattr(attachment, "content_type", None) or "").lower()
+    if content_type.startswith("image/"):
+        return True
+    filename = (getattr(attachment, "filename", None) or "").lower()
+    return any(filename.endswith(ext) for ext in AI_IMAGE_FILE_EXTENSIONS)
+
+
+def extract_message_image_urls(message) -> list[str]:
+    image_urls = []
+
+    for attachment in getattr(message, "attachments", []) or []:
+        if is_image_attachment(attachment):
+            image_urls.append(getattr(attachment, "url", None))
+
+    for embed in getattr(message, "embeds", []) or []:
+        image = getattr(embed, "image", None)
+        image_url = getattr(image, "url", None)
+        if image_url:
+            image_urls.append(image_url)
+
+    for url in extract_urls_from_text(getattr(message, "content", "") or ""):
+        if is_probable_image_url(url):
+            image_urls.append(url)
+
+    return dedupe_preserve_order(image_urls)
+
+
+def summarize_embed(embed) -> str | None:
+    pieces = []
+    title = normalize_ai_summary_text(getattr(embed, "title", "") or "", max_chars=120)
+    description = normalize_ai_summary_text(getattr(embed, "description", "") or "", max_chars=180)
+    if title:
+        pieces.append(title)
+    if description:
+        pieces.append(description)
+
+    if not pieces:
+        return None
+    return f"[Link preview] {' - '.join(pieces)}"
+
+
+def format_url_preview(url: str, title: str | None, description: str | None) -> str | None:
+    title = normalize_ai_summary_text(title or "", max_chars=120)
+    description = normalize_ai_summary_text(description or "", max_chars=180)
+    host = (urlparse(url).hostname or "").lower()
+    if title and description:
+        return f"[Fetched link context from {host}] {title} - {description}"
+    if title:
+        return f"[Fetched link context from {host}] {title}"
+    if description:
+        return f"[Fetched link context from {host}] {description}"
+    return None
+
+
+def _extract_meta_content(html_text: str, key: str) -> str | None:
+    patterns = [
+        rf'<meta[^>]+(?:property|name)=["\']{re.escape(key)}["\'][^>]+content=["\'](.*?)["\']',
+        rf'<meta[^>]+content=["\'](.*?)["\'][^>]+(?:property|name)=["\']{re.escape(key)}["\']',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            return normalize_ai_summary_text(match.group(1))
+    return None
+
+
+def _extract_html_title_and_description(html_text: str) -> tuple[str | None, str | None]:
+    title = (
+        _extract_meta_content(html_text, "og:title")
+        or _extract_meta_content(html_text, "twitter:title")
+    )
+    if not title:
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", html_text, flags=re.IGNORECASE | re.DOTALL)
+        if title_match:
+            title = normalize_ai_summary_text(title_match.group(1))
+
+    description = (
+        _extract_meta_content(html_text, "og:description")
+        or _extract_meta_content(html_text, "twitter:description")
+        or _extract_meta_content(html_text, "description")
+    )
+    return title, description
+
+
+def _is_public_fetch_host(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+
+    normalized = hostname.strip("[]").lower()
+    if normalized in {"localhost", "0.0.0.0"} or normalized.endswith(".local"):
+        return False
+
+    try:
+        addresses = {
+            addr_info[4][0].split("%", 1)[0]
+            for addr_info in socket.getaddrinfo(normalized, None)
+        }
+    except socket.gaierror:
+        return False
+
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+    return True
+
+
+def _fetch_public_link_preview(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not _is_public_fetch_host(parsed.hostname):
+        return None
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": YOUTUBE_REQUEST_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=AI_LINK_PREVIEW_TIMEOUT_SECONDS) as response:
+        final_url = response.geturl()
+        final_parsed = urlparse(final_url)
+        if final_parsed.scheme not in {"http", "https"} or not _is_public_fetch_host(final_parsed.hostname):
+            return None
+
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        if "html" not in content_type:
+            return None
+
+        charset = response.headers.get_content_charset() or "utf-8"
+        html_text = response.read(AI_LINK_PREVIEW_MAX_BYTES).decode(charset, errors="replace")
+
+    title, description = _extract_html_title_and_description(html_text)
+    return format_url_preview(final_url, title, description)
+
+
+async def get_url_preview_text(
+    url: str,
+    preview_cache: dict[str, str | None],
+    preview_state: dict[str, int],
+) -> str | None:
+    if url in preview_cache:
+        return preview_cache[url]
+    if preview_state["used"] >= AI_CONTEXT_LINK_PREVIEW_LIMIT:
+        preview_cache[url] = None
+        return None
+
+    preview_state["used"] += 1
+    try:
+        preview = await asyncio.to_thread(_fetch_public_link_preview, url)
+    except OSError:
+        preview = None
+
+    preview_cache[url] = preview
+    return preview
+
+
+async def build_ai_context_entry(
+    message,
+    preview_cache: dict[str, str | None],
+    preview_state: dict[str, int],
+    strip_bot_mention_id: int | None = None,
+) -> AIContextEntry | None:
+    if getattr(message, "webhook_id", None) is not None:
+        return None
+
+    raw_content = getattr(message, "content", "") or ""
+    if strip_bot_mention_id is not None:
+        raw_content = extract_bot_mention_prompt(raw_content, strip_bot_mention_id)
+    content = normalize_ai_context_content(raw_content)
+
+    lines = []
+    if content:
+        lines.append(content)
+
+    image_urls = extract_message_image_urls(message)
+    if image_urls:
+        lines.append("[Shared image attached below]")
+
+    for embed in getattr(message, "embeds", []) or []:
+        embed_summary = summarize_embed(embed)
+        if embed_summary:
+            lines.append(embed_summary)
+
+    for url in extract_urls_from_text(raw_content):
+        if is_probable_image_url(url):
+            continue
+        preview_text = await get_url_preview_text(url, preview_cache, preview_state)
+        if preview_text:
+            lines.append(preview_text)
+
+    text = "\n".join(dedupe_preserve_order(lines)).strip()
+    if not text and not image_urls:
+        return None
+
+    author = getattr(message, "author", None)
+    author_name = getattr(author, "display_name", str(author) if author is not None else "Unknown")
+    return AIContextEntry(author_name=author_name, text=text, image_urls=image_urls)
+
+
+def build_ai_request_input(conversation_prompt: str, image_urls: list[str]):
+    content = [{"type": "input_text", "text": conversation_prompt}]
+    for image_url in image_urls[:AI_CONTEXT_IMAGE_LIMIT]:
+        content.append({"type": "input_image", "image_url": image_url})
+    return [{"role": "user", "content": content}]
+
+
+def select_ai_context_entries(history_messages, limit: int = AI_CONTEXT_MESSAGE_LIMIT) -> list[AIContextEntry]:
+    entries: list[AIContextEntry] = []
     for history_message in history_messages:
         if getattr(history_message, "webhook_id", None) is not None:
             continue
 
         content = normalize_ai_context_content(getattr(history_message, "content", ""))
-        if not content:
+        image_urls = extract_message_image_urls(history_message)
+        if not content and not image_urls:
             continue
 
         author = getattr(history_message, "author", None)
         author_name = getattr(author, "display_name", str(author) if author is not None else "Unknown")
-        entries.append((author_name, content))
+        entry_text = content or "[Shared image attached below]"
+        entries.append(AIContextEntry(author_name=author_name, text=entry_text, image_urls=image_urls))
         if len(entries) >= limit:
             break
 
@@ -348,7 +618,10 @@ def select_ai_context_entries(history_messages, limit: int = AI_CONTEXT_MESSAGE_
     return entries
 
 
-async def fetch_ai_context_entries(message: discord.Message) -> list[tuple[str, str]]:
+async def fetch_ai_context_entries(
+    message: discord.Message,
+    bot_user_id: int,
+) -> tuple[list[AIContextEntry], AIContextEntry]:
     history_messages = []
     async for previous_message in message.channel.history(
         limit=AI_CONTEXT_HISTORY_SCAN_LIMIT,
@@ -357,18 +630,39 @@ async def fetch_ai_context_entries(message: discord.Message) -> list[tuple[str, 
     ):
         history_messages.append(previous_message)
 
-    return select_ai_context_entries(history_messages)
+    preview_cache: dict[str, str | None] = {}
+    preview_state = {"used": 0}
+    context_entries: list[AIContextEntry] = []
+    for previous_message in history_messages:
+        entry = await build_ai_context_entry(previous_message, preview_cache, preview_state)
+        if entry is None:
+            continue
+        context_entries.append(entry)
+        if len(context_entries) >= AI_CONTEXT_MESSAGE_LIMIT:
+            break
+
+    current_entry = await build_ai_context_entry(
+        message,
+        preview_cache,
+        preview_state,
+        strip_bot_mention_id=bot_user_id,
+    )
+    if current_entry is None:
+        author_name = getattr(message.author, "display_name", str(message.author))
+        current_entry = AIContextEntry(author_name=author_name, text="", image_urls=[])
+
+    context_entries.reverse()
+    return context_entries, current_entry
 
 
 def build_ai_conversation_prompt(
-    context_entries: list[tuple[str, str]],
-    current_author_name: str,
-    current_prompt: str,
+    context_entries: list[AIContextEntry],
+    current_entry: AIContextEntry,
 ) -> str:
     lines = ["Recent Discord conversation from the same channel:"]
-    for author_name, content in context_entries:
-        lines.append(f"{author_name}: {content}")
-    lines.append(f"{current_author_name}: {current_prompt}")
+    for entry in context_entries:
+        lines.append(f"{entry.author_name}: {entry.text}")
+    lines.append(f"{current_entry.author_name}: {current_entry.text}")
     lines.append("")
     lines.append("Reply to the latest message only.")
     return "\n".join(lines)
@@ -381,21 +675,35 @@ def trim_ai_reply(text: str, max_chars: int = AI_MAX_REPLY_CHARS) -> str:
     return text[: max_chars - 3].rstrip() + "..."
 
 
-def get_ai_cooldown_remaining(user_id: int, now: float | None = None) -> float:
-    last_used = ai_cooldowns.get(user_id)
-    if last_used is None:
-        return 0.0
-
+def get_ai_timeout_remaining(user_id: int, now: float | None = None) -> float:
     current_time = time.monotonic() if now is None else now
-    remaining = AI_COOLDOWN_SECONDS - (current_time - last_used)
+    timeout_until = ai_user_timeout_until.get(user_id)
+    if timeout_until is None:
+        return 0.0
+    remaining = timeout_until - current_time
     if remaining <= 0:
-        ai_cooldowns.pop(user_id, None)
+        ai_user_timeout_until.pop(user_id, None)
         return 0.0
     return remaining
 
 
-def mark_ai_cooldown(user_id: int, now: float | None = None):
-    ai_cooldowns[user_id] = time.monotonic() if now is None else now
+def register_ai_prompt_attempt(user_id: int, now: float | None = None) -> float:
+    current_time = time.monotonic() if now is None else now
+    timeout_remaining = get_ai_timeout_remaining(user_id, current_time)
+    if timeout_remaining > 0:
+        return timeout_remaining
+
+    prompt_times = ai_recent_prompt_times.setdefault(user_id, deque())
+    while prompt_times and (current_time - prompt_times[0]) >= AI_RATE_LIMIT_WINDOW_SECONDS:
+        prompt_times.popleft()
+
+    prompt_times.append(current_time)
+    if len(prompt_times) > AI_RATE_LIMIT_MAX_REQUESTS:
+        ai_user_timeout_until[user_id] = current_time + AI_RATE_LIMIT_TIMEOUT_SECONDS
+        prompt_times.clear()
+        return AI_RATE_LIMIT_TIMEOUT_SECONDS
+
+    return 0.0
 
 
 def get_openai_client():
@@ -410,7 +718,7 @@ def get_openai_client():
     return ai_client
 
 
-async def request_ai_reply(conversation_prompt: str) -> str:
+async def request_ai_reply(conversation_prompt: str, image_urls: list[str] | None = None) -> str:
     client = get_openai_client()
     if client is None:
         reason = "missing OPENAI_API_KEY"
@@ -418,11 +726,13 @@ async def request_ai_reply(conversation_prompt: str) -> str:
             reason = f"openai package unavailable: {OPENAI_IMPORT_ERROR}"
         raise AIConfigurationError(f"AI replies are not configured: {reason}")
 
+    request_input = build_ai_request_input(conversation_prompt, image_urls or [])
+
     async def _create_response(max_output_tokens: int):
         return await client.responses.create(
             model=OPENAI_MODEL,
             instructions=AI_SYSTEM_PROMPT,
-            input=conversation_prompt,
+            input=request_input,
             max_output_tokens=max_output_tokens,
             reasoning={"effort": AI_REASONING_EFFORT},
             text={"verbosity": AI_TEXT_VERBOSITY},
@@ -486,19 +796,21 @@ async def handle_ai_mention(message: discord.Message, bot_user_id: int) -> bool:
     if not prompt:
         return False
 
-    cooldown_remaining = get_ai_cooldown_remaining(message.author.id)
-    if cooldown_remaining > 0:
-        await send_message_reply(message, AI_COOLDOWN_MESSAGE)
+    timeout_remaining = register_ai_prompt_attempt(message.author.id)
+    if timeout_remaining > 0:
+        await send_message_reply(message, AI_TIMEOUT_MESSAGE)
         return True
 
-    context_entries = await fetch_ai_context_entries(message)
-    conversation_prompt = build_ai_conversation_prompt(
-        context_entries,
-        message.author.display_name,
-        prompt,
+    context_entries, current_entry = await fetch_ai_context_entries(message, bot_user_id)
+    conversation_prompt = build_ai_conversation_prompt(context_entries, current_entry)
+    image_urls = dedupe_preserve_order(
+        [
+            image_url
+            for entry in [*context_entries, current_entry]
+            for image_url in entry.image_urls
+        ]
     )
 
-    mark_ai_cooldown(message.author.id)
     started_at = time.perf_counter()
     print(
         f"[ai] request start user={message.author.id} "
@@ -507,7 +819,7 @@ async def handle_ai_mention(message: discord.Message, bot_user_id: int) -> bool:
 
     async with message.channel.typing():
         try:
-            reply_text = await request_ai_reply(conversation_prompt)
+            reply_text = await request_ai_reply(conversation_prompt, image_urls=image_urls)
         except AIConfigurationError as exc:
             print(f"[ai] request skipped user={message.author.id} reason={exc}")
             await send_message_reply(message, AI_NOT_CONFIGURED_MESSAGE)
@@ -554,7 +866,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # serialize DB writes to avoid sqlite "database is locked"
 db_write_lock = asyncio.Lock()
 ai_client = None
-ai_cooldowns: dict[int, float] = {}
+ai_recent_prompt_times: dict[int, deque[float]] = {}
+ai_user_timeout_until: dict[int, float] = {}
 
 
 

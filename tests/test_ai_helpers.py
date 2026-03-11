@@ -12,7 +12,8 @@ poopbot = importlib.import_module("poopbot")
 
 class AIHelperTests(unittest.TestCase):
     def tearDown(self):
-        poopbot.ai_cooldowns.clear()
+        poopbot.ai_recent_prompt_times.clear()
+        poopbot.ai_user_timeout_until.clear()
 
     def test_extract_bot_mention_prompt_removes_bot_mentions(self):
         prompt = poopbot.extract_bot_mention_prompt(
@@ -26,6 +27,35 @@ class AIHelperTests(unittest.TestCase):
         self.assertTrue(poopbot.message_mentions_bot_content("<@!123> hi", 123))
         self.assertFalse(poopbot.message_mentions_bot_content("<@456> hi", 123))
 
+    def test_extract_urls_from_text_normalizes_trailing_punctuation(self):
+        urls = poopbot.extract_urls_from_text(
+            "Look at https://example.com/test, and https://example.com/test.)"
+        )
+        self.assertEqual(urls, ["https://example.com/test"])
+
+    def test_extract_message_image_urls_includes_attachments_and_direct_image_links(self):
+        message = types.SimpleNamespace(
+            content="https://cdn.example.com/image.png",
+            attachments=[
+                types.SimpleNamespace(
+                    url="https://cdn.discordapp.com/attachments/1/example.jpg",
+                    content_type="image/jpeg",
+                    filename="example.jpg",
+                )
+            ],
+            embeds=[],
+        )
+
+        image_urls = poopbot.extract_message_image_urls(message)
+
+        self.assertEqual(
+            image_urls,
+            [
+                "https://cdn.discordapp.com/attachments/1/example.jpg",
+                "https://cdn.example.com/image.png",
+            ],
+        )
+
     def test_select_ai_context_entries_filters_empty_messages_and_caps_to_ten(self):
         history_messages = []
         for index in range(12, 0, -1):
@@ -35,6 +65,8 @@ class AIHelperTests(unittest.TestCase):
             history_messages.append(
                 types.SimpleNamespace(
                     content=content,
+                    attachments=[],
+                    embeds=[],
                     webhook_id=None,
                     author=types.SimpleNamespace(display_name=f"user-{index}"),
                 )
@@ -43,19 +75,58 @@ class AIHelperTests(unittest.TestCase):
         entries = poopbot.select_ai_context_entries(history_messages)
 
         self.assertEqual(len(entries), 10)
-        self.assertEqual(entries[0], ("user-2", "message 2"))
-        self.assertEqual(entries[-1], ("user-12", "message 12"))
-        self.assertNotIn(("user-7", ""), entries)
+        self.assertEqual(entries[0].author_name, "user-2")
+        self.assertEqual(entries[0].text, "message 2")
+        self.assertEqual(entries[-1].author_name, "user-12")
+        self.assertEqual(entries[-1].text, "message 12")
 
-    def test_get_ai_cooldown_remaining_expires(self):
-        poopbot.mark_ai_cooldown(42, now=100.0)
-        self.assertEqual(poopbot.get_ai_cooldown_remaining(42, now=100.0), poopbot.AI_COOLDOWN_SECONDS)
-        self.assertEqual(poopbot.get_ai_cooldown_remaining(42, now=131.0), 0.0)
+    def test_register_ai_prompt_attempt_triggers_timeout_after_sixth_prompt(self):
+        for second in range(5):
+            self.assertEqual(poopbot.register_ai_prompt_attempt(42, now=float(second)), 0.0)
+
+        timeout = poopbot.register_ai_prompt_attempt(42, now=5.0)
+
+        self.assertEqual(timeout, poopbot.AI_RATE_LIMIT_TIMEOUT_SECONDS)
+        self.assertGreater(poopbot.get_ai_timeout_remaining(42, now=5.0), 0.0)
+
+
+class AIContextEntryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_build_ai_context_entry_includes_link_preview_and_image_marker(self):
+        message = types.SimpleNamespace(
+            content="check this https://example.com/post",
+            attachments=[
+                types.SimpleNamespace(
+                    url="https://cdn.discordapp.com/attachments/1/example.jpg",
+                    content_type="image/jpeg",
+                    filename="example.jpg",
+                )
+            ],
+            embeds=[],
+            webhook_id=None,
+            author=types.SimpleNamespace(display_name="Alice"),
+        )
+
+        with mock.patch.object(
+            poopbot,
+            "get_url_preview_text",
+            new=mock.AsyncMock(return_value="[Fetched link context from example.com] Example title"),
+        ):
+            entry = await poopbot.build_ai_context_entry(message, {}, {"used": 0})
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.author_name, "Alice")
+        self.assertIn("[Shared image attached below]", entry.text)
+        self.assertIn("Example title", entry.text)
+        self.assertEqual(
+            entry.image_urls,
+            ["https://cdn.discordapp.com/attachments/1/example.jpg"],
+        )
 
 
 class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
-        poopbot.ai_cooldowns.clear()
+        poopbot.ai_recent_prompt_times.clear()
+        poopbot.ai_user_timeout_until.clear()
         poopbot.ai_client = None
 
     async def test_request_ai_reply_uses_responses_api(self):
@@ -68,12 +139,15 @@ class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
 
         poopbot.ai_client = types.SimpleNamespace(responses=FakeResponses())
 
-        reply = await poopbot.request_ai_reply("Alice: hi")
+        reply = await poopbot.request_ai_reply("Alice: hi", image_urls=["https://cdn.example.com/test.png"])
 
         self.assertEqual(reply, "Short answer")
         self.assertEqual(captured["model"], poopbot.OPENAI_MODEL)
         self.assertEqual(captured["instructions"], poopbot.AI_SYSTEM_PROMPT)
-        self.assertEqual(captured["input"], "Alice: hi")
+        self.assertEqual(
+            captured["input"],
+            poopbot.build_ai_request_input("Alice: hi", ["https://cdn.example.com/test.png"]),
+        )
         self.assertEqual(captured["max_output_tokens"], poopbot.AI_MAX_OUTPUT_TOKENS)
         self.assertEqual(captured["reasoning"], {"effort": poopbot.AI_REASONING_EFFORT})
         self.assertEqual(captured["text"], {"verbosity": poopbot.AI_TEXT_VERBOSITY})
@@ -136,7 +210,16 @@ class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
         poopbot.ai_client = types.SimpleNamespace(responses=FakeResponses())
         message = FakeMessage()
 
-        with mock.patch.object(poopbot, "fetch_ai_context_entries", new=mock.AsyncMock(return_value=[])):
+        with mock.patch.object(
+            poopbot,
+            "fetch_ai_context_entries",
+            new=mock.AsyncMock(
+                return_value=(
+                    [],
+                    poopbot.AIContextEntry(author_name="Alice", text="hello there", image_urls=[]),
+                )
+            ),
+        ):
             handled = await poopbot.handle_ai_mention(message, 123)
 
         self.assertTrue(handled)
