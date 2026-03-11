@@ -209,6 +209,9 @@ class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
         class FakeChannel:
             id = 999
 
+            def __init__(self):
+                self.sent_messages = []
+
             def typing(self):
                 return FakeTyping()
 
@@ -216,15 +219,14 @@ class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
                 if False:
                     yield None
 
+            async def send(self, text, **kwargs):
+                self.sent_messages.append((text, kwargs))
+
         class FakeMessage:
             def __init__(self):
                 self.content = "<@123> hello there"
                 self.author = types.SimpleNamespace(id=1, display_name="Alice")
                 self.channel = FakeChannel()
-                self.replies = []
-
-            async def reply(self, text, **kwargs):
-                self.replies.append((text, kwargs))
 
         poopbot.ai_client = types.SimpleNamespace(responses=FakeResponses())
         message = FakeMessage()
@@ -242,7 +244,7 @@ class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
             handled = await poopbot.handle_ai_mention(message, 123)
 
         self.assertTrue(handled)
-        self.assertEqual(message.replies[0][0], poopbot.AI_ERROR_MESSAGE)
+        self.assertEqual(message.channel.sent_messages[0][0], poopbot.AI_ERROR_MESSAGE)
 
 
 if __name__ == "__main__":
