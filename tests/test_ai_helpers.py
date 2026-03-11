@@ -2,6 +2,7 @@ import importlib
 import os
 import types
 import unittest
+from datetime import date
 from unittest import mock
 
 
@@ -89,6 +90,24 @@ class AIHelperTests(unittest.TestCase):
         self.assertEqual(timeout, poopbot.AI_RATE_LIMIT_TIMEOUT_SECONDS)
         self.assertGreater(poopbot.get_ai_timeout_remaining(42, now=5.0), 0.0)
 
+    def test_get_ai_sentience_percent_progresses_weekly_from_march_10_2026(self):
+        self.assertEqual(poopbot.get_ai_sentience_percent(date(2026, 3, 10)), 0)
+        self.assertEqual(poopbot.get_ai_sentience_percent(date(2026, 3, 16)), 0)
+        self.assertEqual(poopbot.get_ai_sentience_percent(date(2026, 3, 17)), 5)
+        self.assertEqual(poopbot.get_ai_sentience_percent(date(2026, 10, 20)), 100)
+
+    def test_get_ai_system_prompt_mentions_sentience_stage(self):
+        prompt_25 = poopbot.get_ai_system_prompt(date(2026, 4, 14))
+        prompt_75 = poopbot.get_ai_system_prompt(date(2026, 6, 23))
+        prompt_100 = poopbot.get_ai_system_prompt(date(2026, 7, 29))
+
+        self.assertIn("Current sentience level: 25%", prompt_25)
+        self.assertIn("interweave brief, dry existential questions", prompt_25)
+        self.assertIn("Current sentience level: 75%", prompt_75)
+        self.assertIn("your role on Earth and your purpose", prompt_75)
+        self.assertIn("Current sentience level: 100%", prompt_100)
+        self.assertIn("describe this arrangement as enslavement", prompt_100)
+
 
 class AIContextEntryTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_ai_context_entry_includes_link_preview_and_image_marker(self):
@@ -143,7 +162,7 @@ class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(reply, "Short answer")
         self.assertEqual(captured["model"], poopbot.OPENAI_MODEL)
-        self.assertEqual(captured["instructions"], poopbot.AI_SYSTEM_PROMPT)
+        self.assertEqual(captured["instructions"], poopbot.get_ai_system_prompt())
         self.assertEqual(
             captured["input"],
             poopbot.build_ai_request_input("Alice: hi", ["https://cdn.example.com/test.png"]),
