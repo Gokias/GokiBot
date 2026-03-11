@@ -79,7 +79,7 @@ AI_COOLDOWN_SECONDS = 30
 AI_MAX_OUTPUT_TOKENS = 220
 AI_RETRY_MAX_OUTPUT_TOKENS = 600
 AI_MAX_REPLY_CHARS = 1800
-AI_REASONING_EFFORT = "none"
+AI_REASONING_EFFORT = "minimal"
 AI_TEXT_VERBOSITY = "low"
 AI_SYSTEM_PROMPT = (
     "You are PoopBot. Unless the user asks for more detail, answer directly and briefly. "
