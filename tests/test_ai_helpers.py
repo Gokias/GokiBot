@@ -15,6 +15,7 @@ class AIHelperTests(unittest.TestCase):
     def tearDown(self):
         poopbot.ai_recent_prompt_times.clear()
         poopbot.ai_user_timeout_until.clear()
+        poopbot.ai_token_encoder = None
 
     def test_extract_bot_mention_prompt_removes_bot_mentions(self):
         prompt = poopbot.extract_bot_mention_prompt(
@@ -27,6 +28,11 @@ class AIHelperTests(unittest.TestCase):
         self.assertTrue(poopbot.message_mentions_bot_content("<@123> hi", 123))
         self.assertTrue(poopbot.message_mentions_bot_content("<@!123> hi", 123))
         self.assertFalse(poopbot.message_mentions_bot_content("<@456> hi", 123))
+
+    def test_is_ai_reset_prompt_matches_reset_only(self):
+        self.assertTrue(poopbot.is_ai_reset_prompt("reset"))
+        self.assertTrue(poopbot.is_ai_reset_prompt("  RESET!!! "))
+        self.assertFalse(poopbot.is_ai_reset_prompt("reset this"))
 
     def test_extract_urls_from_text_normalizes_trailing_punctuation(self):
         urls = poopbot.extract_urls_from_text(
@@ -57,29 +63,33 @@ class AIHelperTests(unittest.TestCase):
             ],
         )
 
-    def test_select_ai_context_entries_filters_empty_messages_and_caps_to_ten(self):
-        history_messages = []
-        for index in range(12, 0, -1):
-            content = f"message {index}"
-            if index == 7:
-                content = "   "
-            history_messages.append(
-                types.SimpleNamespace(
-                    content=content,
-                    attachments=[],
-                    embeds=[],
-                    webhook_id=None,
-                    author=types.SimpleNamespace(display_name=f"user-{index}"),
-                )
+    def test_select_ai_context_entries_uses_token_budget_and_keeps_full_boundary_message(self):
+        newest_first = [
+            poopbot.AIContextEntry(author_name="user-3", text="message 3"),
+            poopbot.AIContextEntry(author_name="user-2", text="message 2"),
+            poopbot.AIContextEntry(author_name="user-1", text="message 1"),
+        ]
+        current_entry = poopbot.AIContextEntry(author_name="current", text="current prompt")
+
+        token_map = {
+            "current: current prompt": 2,
+            "user-3: message 3": 3,
+            "user-2: message 2": 4,
+            "user-1: message 1": 5,
+        }
+
+        with mock.patch.object(
+            poopbot,
+            "count_text_tokens",
+            side_effect=lambda text: token_map[text],
+        ):
+            entries = poopbot.select_ai_context_entries(
+                newest_first,
+                current_entry,
+                token_budget=10,
             )
 
-        entries = poopbot.select_ai_context_entries(history_messages)
-
-        self.assertEqual(len(entries), 10)
-        self.assertEqual(entries[0].author_name, "user-2")
-        self.assertEqual(entries[0].text, "message 2")
-        self.assertEqual(entries[-1].author_name, "user-12")
-        self.assertEqual(entries[-1].text, "message 12")
+        self.assertEqual([entry.author_name for entry in entries], ["user-1", "user-2", "user-3"])
 
     def test_register_ai_prompt_attempt_triggers_timeout_after_sixth_prompt(self):
         for second in range(5):
@@ -141,12 +151,50 @@ class AIContextEntryTests(unittest.IsolatedAsyncioTestCase):
             ["https://cdn.discordapp.com/attachments/1/example.jpg"],
         )
 
+    async def test_fetch_ai_context_entries_stops_at_latest_reset_marker(self):
+        recent_message = types.SimpleNamespace(content="recent context")
+        reset_message = types.SimpleNamespace(content="<@123> reset")
+        old_message = types.SimpleNamespace(content="older context")
+
+        class FakeChannel:
+            async def history(self, **kwargs):
+                for item in [recent_message, reset_message, old_message]:
+                    yield item
+
+        current_message = types.SimpleNamespace(
+            content="<@123> what happened",
+            channel=FakeChannel(),
+            author=types.SimpleNamespace(display_name="Alice"),
+        )
+
+        async def fake_build_ai_context_entry(message, preview_cache, preview_state, strip_bot_mention_id=None):
+            if message is recent_message:
+                return poopbot.AIContextEntry(author_name="Bob", text="recent context", image_urls=[])
+            if message is current_message:
+                return poopbot.AIContextEntry(author_name="Alice", text="what happened", image_urls=[])
+            raise AssertionError(f"Unexpected context entry build for: {message.content}")
+
+        with mock.patch.object(
+            poopbot,
+            "build_ai_context_entry",
+            new=mock.AsyncMock(side_effect=fake_build_ai_context_entry),
+        ), mock.patch.object(
+            poopbot,
+            "count_text_tokens",
+            return_value=1,
+        ):
+            context_entries, current_entry = await poopbot.fetch_ai_context_entries(current_message, 123)
+
+        self.assertEqual([entry.text for entry in context_entries], ["recent context"])
+        self.assertEqual(current_entry.text, "what happened")
+
 
 class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         poopbot.ai_recent_prompt_times.clear()
         poopbot.ai_user_timeout_until.clear()
         poopbot.ai_client = None
+        poopbot.ai_token_encoder = None
 
     async def test_request_ai_reply_uses_responses_api(self):
         captured = {}
@@ -245,6 +293,42 @@ class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(handled)
         self.assertEqual(message.channel.sent_messages[0][0], poopbot.AI_ERROR_MESSAGE)
+
+    async def test_handle_ai_mention_reset_acknowledges_without_calling_api(self):
+        class FakeChannel:
+            id = 999
+
+            def __init__(self):
+                self.sent_messages = []
+
+            def typing(self):
+                raise AssertionError("typing should not start for reset")
+
+            async def send(self, text, **kwargs):
+                self.sent_messages.append((text, kwargs))
+
+        message = types.SimpleNamespace(
+            content="<@123> reset",
+            author=types.SimpleNamespace(id=1, display_name="Alice"),
+            channel=FakeChannel(),
+        )
+
+        with mock.patch.object(
+            poopbot,
+            "fetch_ai_context_entries",
+            new=mock.AsyncMock(),
+        ) as fetch_mock, mock.patch.object(
+            poopbot,
+            "request_ai_reply",
+            new=mock.AsyncMock(),
+        ) as request_mock:
+            handled = await poopbot.handle_ai_mention(message, 123)
+
+        self.assertTrue(handled)
+        self.assertEqual(message.channel.sent_messages[0][0], poopbot.AI_RESET_MESSAGE)
+        self.assertNotIn(1, poopbot.ai_recent_prompt_times)
+        fetch_mock.assert_not_awaited()
+        request_mock.assert_not_awaited()
 
 
 if __name__ == "__main__":

@@ -139,6 +139,7 @@ AI_TIMEOUT_MESSAGE = "Too many prompts in a minute. Try again in 5 minutes."
 AI_RATE_LIMIT_MESSAGE = "I’m a little busy right now. Try again in a moment."
 AI_ERROR_MESSAGE = "I hit an error trying to answer that. Try again in a moment."
 AI_EMPTY_RESPONSE_MESSAGE = "I don't have a reply for that yet."
+AI_RESET_MESSAGE = "Context reset. Future prompts will ignore anything earlier in this channel."
 AI_URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 AI_IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
@@ -404,6 +405,11 @@ def message_mentions_bot_content(content: str, bot_user_id: int) -> bool:
 def extract_bot_mention_prompt(content: str, bot_user_id: int) -> str:
     without_mentions = build_bot_mention_regex(bot_user_id).sub(" ", content)
     return re.sub(r"\s+", " ", without_mentions).strip()
+
+
+def is_ai_reset_prompt(prompt: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", (prompt or "").lower())
+    return normalized == "reset"
 
 
 def normalize_ai_context_content(content: str) -> str:
@@ -732,6 +738,11 @@ async def fetch_ai_context_entries(
     preview_state = {"used": 0}
     history_entries_newest_first: list[AIContextEntry] = []
     for previous_message in history_messages:
+        previous_content = getattr(previous_message, "content", "") or ""
+        if message_mentions_bot_content(previous_content, bot_user_id):
+            previous_prompt = extract_bot_mention_prompt(previous_content, bot_user_id)
+            if is_ai_reset_prompt(previous_prompt):
+                break
         entry = await build_ai_context_entry(previous_message, preview_cache, preview_state)
         if entry is None:
             continue
@@ -891,6 +902,9 @@ async def handle_ai_mention(message: discord.Message, bot_user_id: int) -> bool:
     prompt = extract_bot_mention_prompt(message.content, bot_user_id)
     if not prompt:
         return False
+    if is_ai_reset_prompt(prompt):
+        await send_message_reply(message, AI_RESET_MESSAGE)
+        return True
 
     timeout_remaining = register_ai_prompt_attempt(message.author.id)
     if timeout_remaining > 0:
