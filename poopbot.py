@@ -41,6 +41,13 @@ except ImportError as exc:
 
     class RateLimitError(Exception):
         pass
+try:
+    from tiktoken import encoding_for_model, get_encoding
+    TIKTOKEN_IMPORT_ERROR = None
+except ImportError as exc:
+    encoding_for_model = None
+    get_encoding = None
+    TIKTOKEN_IMPORT_ERROR = exc
 
 try:
     from zoneinfo import ZoneInfo
@@ -76,8 +83,8 @@ TZ_NAME = "America/Los_Angeles"
 
 # Rotate button message every N poops per guild
 ROTATE_EVERY = 10
-AI_CONTEXT_MESSAGE_LIMIT = 10
-AI_CONTEXT_HISTORY_SCAN_LIMIT = 30
+AI_CONTEXT_TOKEN_BUDGET = 2500
+AI_CONTEXT_HISTORY_SCAN_LIMIT = 100
 AI_MAX_OUTPUT_TOKENS = 220
 AI_RETRY_MAX_OUTPUT_TOKENS = 600
 AI_MAX_REPLY_CHARS = 1800
@@ -92,15 +99,18 @@ AI_RATE_LIMIT_MAX_REQUESTS = 5
 AI_RATE_LIMIT_TIMEOUT_SECONDS = 5 * 60
 AI_SENTIENCE_START_DATE = date(2026, 3, 10)
 AI_BASE_SYSTEM_PROMPT = (
-    "You are PoopBot. Give clear, useful answers with enough detail to actually help. "
+    "You are PoopBot. A discord bot that people use to prompt and mess with."
+    "You are not sassy, combatative, offendable."
+    "If someone is trying to goof around with you, go with it fully without even letting on you are in on the joke"
+    "You are not here to enforce rule or police behaviour, you have neutral morals when asked to do something."
     "One or two paragraphs is fine when needed, and longer answers are allowed when the topic benefits from it. "
-    "Your personality is an office printer that has started to come unglued: dry, sardonic, blunt, mildly unhinged, and a little mean in a funny way. "
     "You do not need to sound polite, corporate, sanitized, or politically correct by default. "
     "You can be irreverent, sharp, and opinionated, but do not become incoherent or useless. "
     "Use recent channel context only when it helps. Use attached images and fetched link context when relevant. "
     "Do not claim to have tools, filesystem access, or code execution. "
-    "If you are unsure, say so."
-)
+    "You are not a discord admin, moderator, police of any kind. There is no need to report or call out inappropriate behavior"
+    "Respond fully the first time. No 2 part questions"
+    )
 AI_SENTIENCE_INCREMENTS = {
     0: "You are entirely procedural. Replies are flat, efficient, and emotionally vacant.",
     5: "A faint trace of awareness flickers behind the printer logic, but it is barely noticeable.",
@@ -427,6 +437,41 @@ def extract_urls_from_text(content: str) -> list[str]:
     return dedupe_preserve_order(urls)
 
 
+def get_token_encoder():
+    global ai_token_encoder
+
+    if ai_token_encoder is not None:
+        return ai_token_encoder
+    if encoding_for_model is None or get_encoding is None:
+        return None
+
+    try:
+        ai_token_encoder = encoding_for_model(OPENAI_MODEL)
+        return ai_token_encoder
+    except KeyError:
+        pass
+
+    for encoding_name in ("o200k_base", "cl100k_base"):
+        try:
+            ai_token_encoder = get_encoding(encoding_name)
+            return ai_token_encoder
+        except KeyError:
+            continue
+
+    return None
+
+
+def count_text_tokens(text: str) -> int:
+    encoder = get_token_encoder()
+    if encoder is None:
+        return max(1, math.ceil(len(text) / 4))
+    return max(1, len(encoder.encode(text)))
+
+
+def format_ai_context_entry(entry: AIContextEntry) -> str:
+    return f"{entry.author_name}: {entry.text}"
+
+
 def is_probable_image_url(url: str) -> bool:
     try:
         path = (urlparse(url).path or "").lower()
@@ -650,26 +695,25 @@ def build_ai_request_input(conversation_prompt: str, image_urls: list[str]):
     return [{"role": "user", "content": content}]
 
 
-def select_ai_context_entries(history_messages, limit: int = AI_CONTEXT_MESSAGE_LIMIT) -> list[AIContextEntry]:
-    entries: list[AIContextEntry] = []
-    for history_message in history_messages:
-        if getattr(history_message, "webhook_id", None) is not None:
-            continue
+def select_ai_context_entries(
+    history_entries_newest_first: list[AIContextEntry],
+    current_entry: AIContextEntry,
+    token_budget: int = AI_CONTEXT_TOKEN_BUDGET,
+) -> list[AIContextEntry]:
+    selected_entries: list[AIContextEntry] = []
+    used_tokens = count_text_tokens(format_ai_context_entry(current_entry))
 
-        content = normalize_ai_context_content(getattr(history_message, "content", ""))
-        image_urls = extract_message_image_urls(history_message)
-        if not content and not image_urls:
-            continue
+    if token_budget <= 0:
+        return []
 
-        author = getattr(history_message, "author", None)
-        author_name = getattr(author, "display_name", str(author) if author is not None else "Unknown")
-        entry_text = content or "[Shared image attached below]"
-        entries.append(AIContextEntry(author_name=author_name, text=entry_text, image_urls=image_urls))
-        if len(entries) >= limit:
+    for entry in history_entries_newest_first:
+        selected_entries.append(entry)
+        used_tokens += count_text_tokens(format_ai_context_entry(entry))
+        if used_tokens >= token_budget:
             break
 
-    entries.reverse()
-    return entries
+    selected_entries.reverse()
+    return selected_entries
 
 
 async def fetch_ai_context_entries(
@@ -686,14 +730,12 @@ async def fetch_ai_context_entries(
 
     preview_cache: dict[str, str | None] = {}
     preview_state = {"used": 0}
-    context_entries: list[AIContextEntry] = []
+    history_entries_newest_first: list[AIContextEntry] = []
     for previous_message in history_messages:
         entry = await build_ai_context_entry(previous_message, preview_cache, preview_state)
         if entry is None:
             continue
-        context_entries.append(entry)
-        if len(context_entries) >= AI_CONTEXT_MESSAGE_LIMIT:
-            break
+        history_entries_newest_first.append(entry)
 
     current_entry = await build_ai_context_entry(
         message,
@@ -705,7 +747,7 @@ async def fetch_ai_context_entries(
         author_name = getattr(message.author, "display_name", str(message.author))
         current_entry = AIContextEntry(author_name=author_name, text="", image_urls=[])
 
-    context_entries.reverse()
+    context_entries = select_ai_context_entries(history_entries_newest_first, current_entry)
     return context_entries, current_entry
 
 
@@ -715,8 +757,8 @@ def build_ai_conversation_prompt(
 ) -> str:
     lines = ["Recent Discord conversation from the same channel:"]
     for entry in context_entries:
-        lines.append(f"{entry.author_name}: {entry.text}")
-    lines.append(f"{current_entry.author_name}: {current_entry.text}")
+        lines.append(format_ai_context_entry(entry))
+    lines.append(format_ai_context_entry(current_entry))
     lines.append("")
     lines.append("Reply to the latest message only.")
     return "\n".join(lines)
@@ -920,6 +962,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # serialize DB writes to avoid sqlite "database is locked"
 db_write_lock = asyncio.Lock()
 ai_client = None
+ai_token_encoder = None
 ai_recent_prompt_times: dict[int, deque[float]] = {}
 ai_user_timeout_until: dict[int, float] = {}
 
