@@ -87,6 +87,7 @@ AI_CONTEXT_TOKEN_BUDGET = 2500
 AI_CONTEXT_HISTORY_SCAN_LIMIT = 100
 AI_MAX_OUTPUT_TOKENS = 220
 AI_RETRY_MAX_OUTPUT_TOKENS = 600
+AI_DIAGNOSTIC_MAX_OUTPUT_TOKENS = 20
 AI_MAX_REPLY_CHARS = 1800
 AI_REASONING_EFFORT = "minimal"
 AI_TEXT_VERBOSITY = "low"
@@ -782,6 +783,14 @@ def trim_ai_reply(text: str, max_chars: int = AI_MAX_REPLY_CHARS) -> str:
     return text[: max_chars - 3].rstrip() + "..."
 
 
+def get_ai_mention_channel_status(guild_id: int | None, channel_id: int | None) -> tuple[bool, str]:
+    if guild_id is None:
+        return False, "No. AI mention replies are ignored outside servers."
+    if channel_id == CLEANUP_CHANNEL_ID:
+        return False, "No. This is the cleanup channel, so messages are deleted before AI handling."
+    return True, "Yes. Normal guild mention handling is active here."
+
+
 def get_ai_timeout_remaining(user_id: int, now: float | None = None) -> float:
     current_time = time.monotonic() if now is None else now
     timeout_until = ai_user_timeout_until.get(user_id)
@@ -823,6 +832,47 @@ def get_openai_client():
 
     ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     return ai_client
+
+
+async def run_ai_smoke_test() -> tuple[bool, str]:
+    client = get_openai_client()
+    if client is None:
+        reason = "missing OPENAI_API_KEY"
+        if AsyncOpenAI is None and OPENAI_IMPORT_ERROR is not None:
+            reason = f"openai package unavailable: {OPENAI_IMPORT_ERROR}"
+        return False, f"not configured ({reason})"
+
+    started_at = time.perf_counter()
+    try:
+        response = await client.responses.create(
+            model=OPENAI_MODEL,
+            input="Reply with exactly: OK",
+            max_output_tokens=AI_DIAGNOSTIC_MAX_OUTPUT_TOKENS,
+            reasoning={"effort": AI_REASONING_EFFORT},
+            text={"verbosity": AI_TEXT_VERBOSITY},
+        )
+    except RateLimitError as exc:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+        return False, f"rate limited after {elapsed_ms} ms ({exc})"
+    except (APIConnectionError, APIError) as exc:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+        return False, f"{type(exc).__name__} after {elapsed_ms} ms ({exc})"
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+        return False, f"{type(exc).__name__} after {elapsed_ms} ms ({exc})"
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+    status = getattr(response, "status", "unknown")
+    output_text = normalize_ai_summary_text(getattr(response, "output_text", "") or "", max_chars=80)
+    incomplete_details = getattr(response, "incomplete_details", None)
+    incomplete_reason = getattr(incomplete_details, "reason", None) if incomplete_details else None
+
+    if incomplete_reason:
+        return False, f"incomplete after {elapsed_ms} ms (status={status}, reason={incomplete_reason})"
+    if not output_text:
+        return False, f"empty output after {elapsed_ms} ms (status={status})"
+
+    return True, f"ok after {elapsed_ms} ms (status={status}, output={output_text!r})"
 
 
 async def request_ai_reply(conversation_prompt: str, image_urls: list[str] | None = None) -> str:
@@ -2935,6 +2985,48 @@ async def rebuildpoopdb(interaction: discord.Interaction):
         ephemeral=True,
     )
 
+
+@bot.tree.command(name="diagnostics", description="Run AI mention diagnostics.")
+@app_commands.guild_only()
+async def diagnostics(interaction: discord.Interaction):
+    if not is_dev_user(interaction.user.id):
+        await interaction.response.send_message(
+            "Only the configured dev user can run this command.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    mention_enabled, mention_status = get_ai_mention_channel_status(
+        interaction.guild.id if interaction.guild else None,
+        interaction.channel_id,
+    )
+    timeout_remaining = get_ai_timeout_remaining(interaction.user.id)
+    sentience_percent = get_ai_sentience_percent()
+    discord_latency_ms = round(bot.latency * 1000) if bot.latency == bot.latency else None
+    smoke_ok, smoke_message = await run_ai_smoke_test()
+
+    lines = [
+        "**PoopBot Diagnostics**",
+        f"- Channel mention handling: {mention_status}",
+        f"- Discord gateway latency: {discord_latency_ms} ms" if discord_latency_ms is not None else "- Discord gateway latency: unavailable",
+        f"- OpenAI API key configured: {'Yes' if bool(OPENAI_API_KEY) else 'No'}",
+        f"- OpenAI SDK import: {'OK' if AsyncOpenAI is not None else f'Failed ({OPENAI_IMPORT_ERROR})'}",
+        f"- OpenAI client cached: {'Yes' if ai_client is not None else 'No'}",
+        f"- Model: `{OPENAI_MODEL}`",
+        f"- Context window: {AI_CONTEXT_TOKEN_BUDGET} tokens, up to {AI_CONTEXT_HISTORY_SCAN_LIMIT} scanned messages",
+        f"- Rate limit: {AI_RATE_LIMIT_MAX_REQUESTS} prompts/{AI_RATE_LIMIT_WINDOW_SECONDS}s, timeout {AI_RATE_LIMIT_TIMEOUT_SECONDS}s",
+        f"- Your current timeout: {'none' if timeout_remaining <= 0 else f'{math.ceil(timeout_remaining)}s remaining'}",
+        f"- Sentience level today: {sentience_percent}%",
+        f"- Live OpenAI smoke test: {'PASS' if smoke_ok else 'FAIL'} - {smoke_message}",
+    ]
+    if not mention_enabled:
+        lines.append("- This channel cannot trigger `@PoopBot` AI replies in the current code path.")
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
 @bot.tree.command(name="gokibothelp", description="Show all available GokiBot commands.")
 async def gokibothelp(interaction: discord.Interaction):
     command_lines = [
@@ -2958,6 +3050,9 @@ async def gokibothelp(interaction: discord.Interaction):
             "- `/rebuildpoopdb` — Rebuild poop data from channel history (dev only).",
             "- `/closeticket` — Close the current ticket thread (dev only)."
         ])
+
+    if is_dev_user(interaction.user.id):
+        command_lines.insert(-1, "- `/diagnostics` - Run Discord/OpenAI mention diagnostics (dev only).")
 
     await interaction.response.send_message("\n".join(command_lines), ephemeral=True)
 

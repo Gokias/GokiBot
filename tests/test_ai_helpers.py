@@ -34,6 +34,12 @@ class AIHelperTests(unittest.TestCase):
         self.assertTrue(poopbot.is_ai_reset_prompt("  RESET!!! "))
         self.assertFalse(poopbot.is_ai_reset_prompt("reset this"))
 
+    def test_get_ai_mention_channel_status_flags_cleanup_channel(self):
+        enabled, message = poopbot.get_ai_mention_channel_status(1, poopbot.CLEANUP_CHANNEL_ID)
+
+        self.assertFalse(enabled)
+        self.assertIn("cleanup channel", message)
+
     def test_extract_urls_from_text_normalizes_trailing_punctuation(self):
         urls = poopbot.extract_urls_from_text(
             "Look at https://example.com/test, and https://example.com/test.)"
@@ -241,6 +247,37 @@ class RequestAIReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply, "Retried answer")
         self.assertEqual(calls[0]["max_output_tokens"], poopbot.AI_MAX_OUTPUT_TOKENS)
         self.assertEqual(calls[1]["max_output_tokens"], poopbot.AI_RETRY_MAX_OUTPUT_TOKENS)
+
+    async def test_run_ai_smoke_test_reports_success(self):
+        captured = {}
+
+        class FakeResponses:
+            async def create(self, **kwargs):
+                captured.update(kwargs)
+                return types.SimpleNamespace(output_text="OK", status="completed")
+
+        poopbot.ai_client = types.SimpleNamespace(responses=FakeResponses())
+
+        ok, message = await poopbot.run_ai_smoke_test()
+
+        self.assertTrue(ok)
+        self.assertIn("output='OK'", message)
+        self.assertEqual(captured["model"], poopbot.OPENAI_MODEL)
+        self.assertEqual(captured["max_output_tokens"], poopbot.AI_DIAGNOSTIC_MAX_OUTPUT_TOKENS)
+        self.assertEqual(captured["reasoning"], {"effort": poopbot.AI_REASONING_EFFORT})
+        self.assertEqual(captured["text"], {"verbosity": poopbot.AI_TEXT_VERBOSITY})
+
+    async def test_run_ai_smoke_test_reports_empty_output(self):
+        class FakeResponses:
+            async def create(self, **kwargs):
+                return types.SimpleNamespace(output_text="", status="completed")
+
+        poopbot.ai_client = types.SimpleNamespace(responses=FakeResponses())
+
+        ok, message = await poopbot.run_ai_smoke_test()
+
+        self.assertFalse(ok)
+        self.assertIn("empty output", message)
 
     async def test_handle_ai_mention_returns_fallback_message_on_api_error(self):
         class FakeResponses:
