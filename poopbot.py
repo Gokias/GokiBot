@@ -15,7 +15,7 @@ import json
 import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, date, time as dtime
+from datetime import datetime, timezone, date, time as dtime, timedelta
 from functools import partial
 import time
 from urllib.parse import parse_qs
@@ -65,6 +65,15 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DB_DIR = "db"
 CONFIG_DB_PATH = os.path.join(DB_DIR, "poopbot_config.db")
 CLEANUP_DB_PATH = os.path.join(DB_DIR, "poopbot_cleanup.db")
+WORDLE_DB_PATH = os.path.join(DB_DIR, "poopbot_wordle.db")
+
+WORDLE_CROWN_EMOJI = "\U0001f451"
+WORDLE_GREEN_BLOCK = "\U0001f7e9"
+WORDLE_YELLOW_BLOCK = "\U0001f7e8"
+WORDLE_RED_BLOCK = "\U0001f7e5"
+WORDLE_FAIL_SCORE = 7
+WORDLE_BAR_WIDTH = 16
+WORDLE_HISTORY_SCAN_LIMIT = 200
 
 POOP_EMOJI = "💩"
 UNDO_EMOJI = "🧻"
@@ -163,6 +172,31 @@ class AIContextEntry:
     author_name: str
     text: str
     image_urls: list[str] = field(default_factory=list)
+
+
+@dataclass
+class WordleResultEntry:
+    user_id: int
+    username: str
+    score: int
+    crowned: bool
+
+
+@dataclass
+class WordleParsedSummary:
+    result_date: date
+    entries: list[WordleResultEntry]
+
+
+WORDLE_SUMMARY_HEADER_RE = re.compile(
+    r"\bWordle\b.*yesterday'?s results",
+    re.IGNORECASE | re.DOTALL,
+)
+WORDLE_RESULT_LINE_RE = re.compile(
+    rf"^\s*(?:[-*]\s*)?(?P<crown>{re.escape(WORDLE_CROWN_EMOJI)}\s*)?"
+    r"(?P<score>[xX]|\d+)\s*/\s*6\s*:\s*(?P<players>.+?)\s*$"
+)
+WORDLE_MENTION_RE = re.compile(r"<@!?(\d+)>")
 
 WESROTH_HANDLE_URL = "https://www.youtube.com/@WesRoth"
 WESROTH_CHANNEL_ID = os.getenv("WESROTH_CHANNEL_ID")
@@ -1640,6 +1674,14 @@ def db_cleanup() -> sqlite3.Connection:
     return conn
 
 
+def db_wordle() -> sqlite3.Connection:
+    os.makedirs(DB_DIR, exist_ok=True)
+    conn = sqlite3.connect(WORDLE_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    _apply_sqlite_pragmas(conn)
+    return conn
+
+
 def db_path_for_year(year: int) -> str:
     os.makedirs(DB_DIR, exist_ok=True)
     return os.path.join(DB_DIR, f"poopbot_{year}.db")
@@ -1717,6 +1759,41 @@ def init_cleanup_db():
             content TEXT NOT NULL,
             created_at_utc TEXT NOT NULL
         );
+        """)
+
+
+def init_wordle_db():
+    with db_wordle() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS wordle_config (
+            guild_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_message_id INTEGER,
+            last_sync_at_utc TEXT
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS wordle_results (
+            guild_id INTEGER NOT NULL,
+            result_date TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            crowned INTEGER NOT NULL DEFAULT 0,
+            source_message_id INTEGER NOT NULL,
+            source_created_at_utc TEXT NOT NULL,
+            parsed_at_utc TEXT NOT NULL,
+            PRIMARY KEY (guild_id, result_date, user_id)
+        );
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_wordle_results_user_date
+        ON wordle_results(guild_id, user_id, result_date);
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_wordle_results_source
+        ON wordle_results(guild_id, source_message_id);
         """)
 
 
@@ -1892,6 +1969,71 @@ def get_ticket_by_thread_id(thread_id: int):
             FROM tickets
             WHERE thread_id=?
         """, (thread_id,)).fetchone()
+
+
+def set_wordle_channel(guild_id: int, channel_id: int):
+    init_wordle_db()
+    sync_at = datetime.now(timezone.utc).isoformat()
+    with db_wordle() as conn:
+        conn.execute("""
+            INSERT INTO wordle_config(guild_id, channel_id, enabled, last_sync_at_utc)
+            VALUES(?, ?, 1, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                channel_id=excluded.channel_id,
+                enabled=1,
+                last_sync_at_utc=excluded.last_sync_at_utc
+        """, (guild_id, channel_id, sync_at))
+
+
+def get_wordle_config(guild_id: int):
+    init_wordle_db()
+    with db_wordle() as conn:
+        return conn.execute("""
+            SELECT guild_id, channel_id, enabled, last_message_id, last_sync_at_utc
+            FROM wordle_config
+            WHERE enabled=1 AND guild_id=?
+        """, (guild_id,)).fetchone()
+
+
+def get_enabled_wordle_guilds():
+    init_wordle_db()
+    with db_wordle() as conn:
+        return conn.execute("""
+            SELECT guild_id, channel_id, last_message_id, last_sync_at_utc
+            FROM wordle_config
+            WHERE enabled=1
+        """).fetchall()
+
+
+async def update_wordle_sync_state(guild_id: int, last_message_id: int | None = None):
+    init_wordle_db()
+    sync_at = datetime.now(timezone.utc).isoformat()
+    async with db_write_lock:
+        with db_wordle() as conn:
+            if last_message_id is None:
+                conn.execute("""
+                    UPDATE wordle_config
+                    SET last_sync_at_utc=?
+                    WHERE guild_id=?
+                """, (sync_at, guild_id))
+            else:
+                conn.execute("""
+                    UPDATE wordle_config
+                    SET last_sync_at_utc=?,
+                        last_message_id=CASE
+                            WHEN last_message_id IS NULL OR last_message_id < ?
+                            THEN ?
+                            ELSE last_message_id
+                        END
+                    WHERE guild_id=?
+                """, (sync_at, last_message_id, last_message_id, guild_id))
+
+
+async def clear_wordle_results_for_guild(guild_id: int):
+    init_wordle_db()
+    async with db_write_lock:
+        with db_wordle() as conn:
+            conn.execute("DELETE FROM wordle_results WHERE guild_id=?", (guild_id,))
 
 
 # =========================
@@ -2124,6 +2266,312 @@ async def log_cleanup_message(message: discord.Message):
     )
 
 
+def extract_wordle_message_text(message: discord.Message) -> str:
+    parts: list[str] = []
+    if message.content:
+        parts.append(message.content)
+
+    for embed in message.embeds:
+        if embed.title:
+            parts.append(embed.title)
+        if embed.description:
+            parts.append(embed.description)
+        for field in embed.fields:
+            if field.name and field.value:
+                parts.append(f"{field.name}: {field.value}")
+            elif field.name:
+                parts.append(field.name)
+            elif field.value:
+                parts.append(field.value)
+        if embed.footer and embed.footer.text:
+            parts.append(embed.footer.text)
+
+    return "\n".join(parts).replace("\u2019", "'")
+
+
+def parse_wordle_score(score_text: str) -> int | None:
+    normalized = score_text.strip().lower()
+    if normalized == "x":
+        return WORDLE_FAIL_SCORE
+    try:
+        score = int(normalized)
+    except ValueError:
+        return None
+    if score < 1:
+        return None
+    return score if score <= 6 else WORDLE_FAIL_SCORE
+
+
+def parse_wordle_summary_text(
+    text: str,
+    result_date: date,
+    mention_names: dict[int, str] | None = None,
+) -> WordleParsedSummary | None:
+    normalized = text.replace("\u2019", "'")
+    if not WORDLE_SUMMARY_HEADER_RE.search(normalized):
+        return None
+
+    names = mention_names or {}
+    entries: dict[int, WordleResultEntry] = {}
+    for line in normalized.splitlines():
+        match = WORDLE_RESULT_LINE_RE.match(line.strip())
+        if match is None:
+            continue
+
+        score = parse_wordle_score(match.group("score"))
+        if score is None:
+            continue
+
+        players_text = match.group("players")
+        crowned = bool(match.group("crown")) or WORDLE_CROWN_EMOJI in players_text
+        for mention_match in WORDLE_MENTION_RE.finditer(players_text):
+            user_id = int(mention_match.group(1))
+            entries[user_id] = WordleResultEntry(
+                user_id=user_id,
+                username=names.get(user_id, f"user-{user_id}"),
+                score=score,
+                crowned=crowned,
+            )
+
+    if not entries:
+        return None
+
+    return WordleParsedSummary(
+        result_date=result_date,
+        entries=list(entries.values()),
+    )
+
+
+def parse_wordle_summary_message(message: discord.Message) -> WordleParsedSummary | None:
+    text = extract_wordle_message_text(message)
+    created_local = message.created_at.astimezone(LOCAL_TZ)
+    result_date = created_local.date() - timedelta(days=1)
+    mention_names = {
+        member.id: getattr(member, "display_name", str(member))
+        for member in message.mentions
+    }
+    return parse_wordle_summary_text(text, result_date, mention_names)
+
+
+async def save_wordle_summary(
+    guild_id: int,
+    source_message_id: int,
+    source_created_at_utc: datetime,
+    parsed: WordleParsedSummary,
+) -> int:
+    init_wordle_db()
+    parsed_at = datetime.now(timezone.utc).isoformat()
+    source_created_at = source_created_at_utc.astimezone(timezone.utc).isoformat()
+    result_date_text = parsed.result_date.isoformat()
+
+    async with db_write_lock:
+        with db_wordle() as conn:
+            conn.execute(
+                "DELETE FROM wordle_results WHERE guild_id=? AND result_date=?",
+                (guild_id, result_date_text),
+            )
+            for entry in parsed.entries:
+                conn.execute("""
+                    INSERT INTO wordle_results(
+                        guild_id, result_date, user_id, username, score, crowned,
+                        source_message_id, source_created_at_utc, parsed_at_utc
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(guild_id, result_date, user_id) DO UPDATE SET
+                        username=excluded.username,
+                        score=excluded.score,
+                        crowned=excluded.crowned,
+                        source_message_id=excluded.source_message_id,
+                        source_created_at_utc=excluded.source_created_at_utc,
+                        parsed_at_utc=excluded.parsed_at_utc
+                """, (
+                    guild_id,
+                    result_date_text,
+                    entry.user_id,
+                    entry.username,
+                    entry.score,
+                    1 if entry.crowned else 0,
+                    source_message_id,
+                    source_created_at,
+                    parsed_at,
+                ))
+
+    await update_wordle_sync_state(guild_id, source_message_id)
+    return len(parsed.entries)
+
+
+async def process_wordle_candidate_message(message: discord.Message) -> int:
+    if message.guild is None:
+        return 0
+
+    cfg = get_wordle_config(message.guild.id)
+    if not cfg or int(cfg["channel_id"]) != message.channel.id:
+        return 0
+
+    parsed = parse_wordle_summary_message(message)
+    if parsed is None:
+        return 0
+
+    try:
+        return await save_wordle_summary(
+            guild_id=message.guild.id,
+            source_message_id=message.id,
+            source_created_at_utc=message.created_at,
+            parsed=parsed,
+        )
+    except sqlite3.Error as exc:
+        print(f"Failed to save Wordle summary message {message.id}: {exc}")
+        return 0
+
+
+async def sync_wordle_channel_history(
+    guild_id: int,
+    channel_id: int,
+    limit: int | None,
+    clear_existing: bool = False,
+) -> dict[str, int]:
+    channel = await bot.fetch_channel(channel_id)
+    if not hasattr(channel, "history"):
+        raise RuntimeError("Configured Wordle channel does not support message history.")
+
+    if clear_existing:
+        await clear_wordle_results_for_guild(guild_id)
+
+    scanned = 0
+    parsed_messages = 0
+    stored_results = 0
+    latest_message_id: int | None = None
+
+    async for message in channel.history(limit=limit, oldest_first=True):
+        scanned += 1
+        latest_message_id = max(latest_message_id or message.id, message.id)
+        parsed = parse_wordle_summary_message(message)
+        if parsed is None:
+            continue
+        stored_results += await save_wordle_summary(
+            guild_id=guild_id,
+            source_message_id=message.id,
+            source_created_at_utc=message.created_at,
+            parsed=parsed,
+        )
+        parsed_messages += 1
+
+    await update_wordle_sync_state(guild_id, latest_message_id)
+    return {
+        "scanned": scanned,
+        "parsed_messages": parsed_messages,
+        "stored_results": stored_results,
+    }
+
+
+def get_wordle_user_rows(guild_id: int, user_id: int) -> tuple[list[sqlite3.Row], date | None]:
+    init_wordle_db()
+    with db_wordle() as conn:
+        rows = conn.execute("""
+            SELECT result_date, score, crowned
+            FROM wordle_results
+            WHERE guild_id=? AND user_id=?
+            ORDER BY result_date ASC
+        """, (guild_id, user_id)).fetchall()
+        latest = conn.execute("""
+            SELECT MAX(result_date) AS latest_result_date
+            FROM wordle_results
+            WHERE guild_id=?
+        """, (guild_id,)).fetchone()
+
+    latest_text = latest["latest_result_date"] if latest else None
+    latest_date = date.fromisoformat(latest_text) if latest_text else None
+    return list(rows), latest_date
+
+
+def normalize_wordle_score(score: int) -> int:
+    return score if 1 <= score <= 6 else WORDLE_FAIL_SCORE
+
+
+def compute_wordle_streaks(
+    rows: list[sqlite3.Row],
+    latest_result_date: date | None,
+) -> tuple[int, int]:
+    scores_by_date: dict[date, int] = {}
+    for row in rows:
+        result_date = date.fromisoformat(row["result_date"])
+        scores_by_date[result_date] = normalize_wordle_score(int(row["score"]))
+
+    longest = 0
+    run = 0
+    previous_date: date | None = None
+    for result_date in sorted(scores_by_date):
+        score = scores_by_date[result_date]
+        if score > 6:
+            run = 0
+        elif previous_date is not None and result_date == previous_date + timedelta(days=1):
+            run += 1
+        else:
+            run = 1
+        longest = max(longest, run)
+        previous_date = result_date
+
+    current = 0
+    cursor = latest_result_date
+    while cursor is not None and scores_by_date.get(cursor, WORDLE_FAIL_SCORE) <= 6:
+        current += 1
+        cursor -= timedelta(days=1)
+
+    return current, longest
+
+
+def format_wordle_score(score: int) -> str:
+    return "X/6" if normalize_wordle_score(score) == WORDLE_FAIL_SCORE else f"{score}/6"
+
+
+def format_wordle_bar(count: int, max_count: int, emoji: str) -> str:
+    if count <= 0 or max_count <= 0:
+        return "-"
+    width = max(1, math.ceil((count / max_count) * WORDLE_BAR_WIDTH))
+    return emoji * width
+
+
+def build_wordle_stats_message(user_mention: str, rows: list[sqlite3.Row], latest_result_date: date | None) -> str:
+    score_counts = {score: 0 for score in range(1, WORDLE_FAIL_SCORE + 1)}
+    crown_count = 0
+    latest_user_date: date | None = None
+    latest_user_score: int | None = None
+
+    for row in rows:
+        score = normalize_wordle_score(int(row["score"]))
+        score_counts[score] += 1
+        crown_count += int(row["crowned"])
+        result_date = date.fromisoformat(row["result_date"])
+        if latest_user_date is None or result_date > latest_user_date:
+            latest_user_date = result_date
+            latest_user_score = score
+
+    current_streak, longest_streak = compute_wordle_streaks(rows, latest_result_date)
+    max_count = max(score_counts.values()) if score_counts else 0
+
+    lines = [
+        f"**{user_mention} Wordle Stats**",
+        f"- Games tracked: **{len(rows)}**",
+        f"- Crowns: **{crown_count}** {WORDLE_CROWN_EMOJI}",
+        f"- Current streak: **{current_streak}**",
+        f"- Longest streak: **{longest_streak}**",
+    ]
+    if latest_user_date is not None and latest_user_score is not None:
+        lines.append(
+            f"- Latest result: **{format_wordle_score(latest_user_score)}** on **{latest_user_date.isoformat()}**"
+        )
+
+    lines.extend(["", "**Guess Distribution**"])
+    for score in range(1, 7):
+        emoji = WORDLE_GREEN_BLOCK if score <= 3 else WORDLE_YELLOW_BLOCK
+        count = score_counts[score]
+        lines.append(f"{score}/6 {format_wordle_bar(count, max_count, emoji)} **{count}**")
+
+    fail_count = score_counts[WORDLE_FAIL_SCORE]
+    lines.append(f"X/6 {format_wordle_bar(fail_count, max_count, WORDLE_RED_BLOCK)} **{fail_count}**")
+    return "\n".join(lines)
+
+
 def find_last_active_poop_event_id(user_id: int, year: int) -> str | None:
     """Most recent POOP in the given year that has NOT been undone by that same user."""
     init_year_db(year)
@@ -2236,12 +2684,28 @@ async def wesroth_upload_watch():
     gset(0, "wesroth_last_post_date_local", datetime.now(LOCAL_TZ).date().isoformat())
 
 
+@tasks.loop(time=dtime(hour=9, minute=30, tzinfo=LOCAL_TZ))
+async def wordle_daily_sync():
+    for row in get_enabled_wordle_guilds():
+        gid = int(row["guild_id"])
+        cid = int(row["channel_id"])
+        try:
+            await sync_wordle_channel_history(
+                guild_id=gid,
+                channel_id=cid,
+                limit=WORDLE_HISTORY_SCAN_LIMIT,
+            )
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException, RuntimeError) as exc:
+            print(f"Wordle daily sync failed for guild={gid} channel={cid}: {exc}")
+
+
 # =========================
 # MESSAGE CLEANUP CHANNEL
 # =========================
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or message.webhook_id is not None:
+        await process_wordle_candidate_message(message)
         return
 
     # delete any non-bot message in the cleanup channel
@@ -2263,6 +2727,12 @@ async def on_message(message: discord.Message):
         await handle_ai_mention(message, bot.user.id)
 
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if after.author.bot or after.webhook_id is not None:
+        await process_wordle_candidate_message(after)
 
 
 # =========================
@@ -2481,6 +2951,22 @@ async def debugpoop(interaction: discord.Interaction):
     await interaction.response.send_message("🧪 Debug: recreated poop button.")
 
 
+@bot.tree.command(name="setwordlechannel", description="Set this channel as the Wordle results channel.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def setwordlechannel(interaction: discord.Interaction):
+    if interaction.guild is None or interaction.channel is None:
+        return
+    set_wordle_channel(interaction.guild.id, interaction.channel.id)
+    await interaction.response.send_message(
+        (
+            f"Wordle channel set to {interaction.channel.mention} for this server.\n"
+            "Run `/createwordledatabase` once to backfill prior results."
+        ),
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="poopstats", description="Show your poop stats for the current year.")
 @app_commands.guild_only()
 async def poopstats(interaction: discord.Interaction):
@@ -2509,6 +2995,26 @@ async def poopstats(interaction: discord.Interaction):
         f"- Avg local time: **{mean_time_str} Pacific**\n"
         f"- Latest poop: **{latest_str}**\n"
         f"- Most poops in one day: **{max_day_str}**"
+    )
+
+
+@bot.tree.command(name="wordlestats", description="Show your Wordle stats.")
+@app_commands.guild_only()
+async def wordlestats(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return
+
+    rows, latest_result_date = get_wordle_user_rows(interaction.guild.id, interaction.user.id)
+    if not rows:
+        await interaction.response.send_message(
+            "No Wordle stats found for you in this server yet.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        build_wordle_stats_message(interaction.user.mention, rows, latest_result_date),
+        ephemeral=True,
     )
 
 
@@ -2987,6 +3493,58 @@ async def rebuildpoopdb(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(
+    name="createwordledatabase",
+    description="Rebuild Wordle stats from the configured Wordle channel history.",
+)
+@app_commands.guild_only()
+async def createwordledatabase(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return
+
+    if not is_dev_user(interaction.user.id):
+        await interaction.response.send_message(
+            "Only the configured dev user can run this command.",
+            ephemeral=True,
+        )
+        return
+
+    cfg = get_wordle_config(interaction.guild.id)
+    if not cfg:
+        await interaction.response.send_message(
+            "No Wordle channel is configured. Run `/setwordlechannel` in the results channel first.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    channel_id = int(cfg["channel_id"])
+    try:
+        stats = await sync_wordle_channel_history(
+            guild_id=interaction.guild.id,
+            channel_id=channel_id,
+            limit=None,
+            clear_existing=True,
+        )
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException, RuntimeError) as exc:
+        await interaction.followup.send(
+            f"I couldn't rebuild the Wordle database from <#{channel_id}>: {exc}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        (
+            f"Wordle database rebuilt from <#{channel_id}>.\n"
+            f"- Scanned messages: **{stats['scanned']}**\n"
+            f"- Parsed Wordle summaries: **{stats['parsed_messages']}**\n"
+            f"- Stored user results: **{stats['stored_results']}**"
+        ),
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="diagnostics", description="Run AI mention diagnostics.")
 @app_commands.guild_only()
 async def diagnostics(interaction: discord.Interaction):
@@ -3033,6 +3591,7 @@ async def gokibothelp(interaction: discord.Interaction):
     command_lines = [
         "**GokiBot Commands**",
         "- `/poopstats` — Show your poop stats for the year.",
+        "- `/wordlestats` — Show your Wordle stats.",
         "- `/featurerequest` — Start a feature request ticket.",
         "- `/collab` — Add someone to the current ticket thread.",
         "- `/gplay <link_or_search>` — Queue and play audio from a link or search term.",
@@ -3048,6 +3607,8 @@ async def gokibothelp(interaction: discord.Interaction):
             "- `/setpoopchannel` — Set the poop logging channel (admin only).",
             "- `/disablepoop` — Disable poop posting (admin only).",
             "- `/debugpoop` — Force-create a new poop button (admin only).",
+            "- `/setwordlechannel` — Set the Wordle results channel (admin only).",
+            "- `/createwordledatabase` — Rebuild Wordle stats from channel history (dev only).",
             "- `/rebuildpoopdb` — Rebuild poop data from channel history (dev only).",
             "- `/closeticket` — Close the current ticket thread (dev only)."
         ])
@@ -3066,6 +3627,7 @@ async def on_ready():
     init_config_db()
     init_year_db(current_year_local())
     init_cleanup_db()
+    init_wordle_db()
 
     try:
         await bot.tree.sync()
@@ -3076,6 +3638,8 @@ async def on_ready():
         daily_midnight_pacific.start()
     if not wesroth_upload_watch.is_running():
         wesroth_upload_watch.start()
+    if not wordle_daily_sync.is_running():
+        wordle_daily_sync.start()
 
     # If configured guilds haven't posted today, post immediately
     today_local = datetime.now(LOCAL_TZ).date().isoformat()
