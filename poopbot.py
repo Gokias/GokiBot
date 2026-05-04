@@ -2572,6 +2572,46 @@ def build_wordle_stats_message(user_mention: str, rows: list[sqlite3.Row], lates
     return "\n".join(lines)
 
 
+class ShareWordleStatsView(discord.ui.View):
+    def __init__(self, owner_user_id: int, message: str):
+        super().__init__(timeout=300)
+        self.owner_user_id = owner_user_id
+        self.message = message
+
+    @discord.ui.button(label="Click here to share in this chat", style=discord.ButtonStyle.green)
+    async def share_wordle_stats(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message(
+                "Only the user who ran `/wordlestats` can share this.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.channel is None or not hasattr(interaction.channel, "send"):
+            await interaction.response.send_message(
+                "I couldn't share this in this chat.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await interaction.channel.send(self.message)
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message(
+                "I couldn't share this in this chat.",
+                ephemeral=True,
+            )
+            return
+
+        button.disabled = True
+        button.label = "Shared in this chat"
+        await interaction.response.edit_message(view=self)
+
+
 def find_last_active_poop_event_id(user_id: int, year: int) -> str | None:
     """Most recent POOP in the given year that has NOT been undone by that same user."""
     init_year_db(year)
@@ -3012,9 +3052,11 @@ async def wordlestats(interaction: discord.Interaction):
         )
         return
 
+    stats_message = build_wordle_stats_message(interaction.user.mention, rows, latest_result_date)
     await interaction.response.send_message(
-        build_wordle_stats_message(interaction.user.mention, rows, latest_result_date),
+        stats_message,
         ephemeral=True,
+        view=ShareWordleStatsView(interaction.user.id, stats_message),
     )
 
 
