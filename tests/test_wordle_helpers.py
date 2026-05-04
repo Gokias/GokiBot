@@ -46,6 +46,17 @@ class WordleHelperTests(unittest.TestCase):
         self.assertEqual(entries[101].score, poopbot.WORDLE_FAIL_SCORE)
         self.assertEqual(entries[202].score, poopbot.WORDLE_FAIL_SCORE)
 
+    def test_parse_wordle_summary_text_uses_results_phrase_as_marker(self):
+        text = (
+            "Your group is on a 15 day streak! Here are yesterday's results:\n"
+            f"{poopbot.WORDLE_CROWN_EMOJI} 3/6: <@101>"
+        )
+
+        parsed = poopbot.parse_wordle_summary_text(text, date(2026, 5, 3))
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.entries[0].user_id, 101)
+
     def test_compute_wordle_streaks_counts_successive_non_fail_days(self):
         rows = [
             {"result_date": "2026-05-01", "score": 4, "crowned": 0},

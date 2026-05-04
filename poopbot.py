@@ -189,8 +189,8 @@ class WordleParsedSummary:
 
 
 WORDLE_SUMMARY_HEADER_RE = re.compile(
-    r"\bWordle\b.*yesterday'?s results",
-    re.IGNORECASE | re.DOTALL,
+    r"\bhere\s+are\s+yesterday'?s\s+results\s*:?",
+    re.IGNORECASE,
 )
 WORDLE_RESULT_LINE_RE = re.compile(
     rf"^\s*(?:[-*]\s*)?(?P<crown>{re.escape(WORDLE_CROWN_EMOJI)}\s*)?"
