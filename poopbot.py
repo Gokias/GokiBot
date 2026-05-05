@@ -2598,8 +2598,9 @@ class ShareWordleStatsView(discord.ui.View):
             )
             return
 
+        public_message = f"{interaction.user.mention} used `/wordlestats`\n{self.message}"
         try:
-            await interaction.channel.send(self.message)
+            await interaction.channel.send(public_message)
         except (discord.Forbidden, discord.HTTPException):
             await interaction.response.send_message(
                 "I couldn't share this in this chat.",
