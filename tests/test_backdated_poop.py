@@ -15,6 +15,7 @@ class BackdatedTimeTests(unittest.TestCase):
     def test_english_dates(self):
         cases = {
             "yesterday at noon": "2026-09-20T19:00:00+00:00",
+            "earlier today at 6am": "2026-09-21T13:00:00+00:00",
             "two hours ago": "2026-09-21T16:30:00+00:00",
             "last Friday at 3pm": "2026-09-18T22:00:00+00:00",
             "on Friday at 3pm": "2026-09-18T22:00:00+00:00",

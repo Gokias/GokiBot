@@ -2241,6 +2241,7 @@ async def replay_event_from_history(
 def parse_backdated_poop_time(text: str, reference: datetime) -> datetime:
     """Parse one explicit time relative to the Discord message, in Pacific time."""
     text = re.sub(r"^on\s+", "", text.strip().rstrip(".! ").lower())
+    text = re.sub(r"^earlier\s+today\b", "today", text)
     if not text or len(text) > 200:
         raise ValueError("Include when it happened, such as 'yesterday at noon'.")
 
@@ -2767,6 +2768,16 @@ def find_last_active_poop_event_id(user_id: int, year: int) -> str | None:
 # =========================
 # BUTTON POSTING (per guild)
 # =========================
+def poop_button_content() -> str:
+    local_now = datetime.now(LOCAL_TZ)
+    return (
+        f"💩 **Click here to log a poop** — {local_now.strftime('%Y-%m-%d')} (Pacific)\n"
+        f"React {POOP_EMOJI} to log.\n"
+        f"React {UNDO_EMOJI} to undo your most recent log.\n"
+        'Missed a log? You can now @poopbot and retroactively log. Ex "I pooped earlier today at 6am"'
+    )
+
+
 async def post_button_for_guild(guild_id: int, channel_id: int):
     channel = await bot.fetch_channel(channel_id)
 
@@ -2781,14 +2792,7 @@ async def post_button_for_guild(guild_id: int, channel_id: int):
             pass
 
     local_now = datetime.now(LOCAL_TZ)
-    msg = await channel.send(
-        f"💩 **Click here to log a poop** — {local_now.strftime('%Y-%m-%d')} (Pacific)\n"
-        f"React {POOP_EMOJI} to log.\n"
-        f"React {UNDO_EMOJI} to undo your most recent log.\n"
-        "Missed a log? Mention me with 'I pooped yesterday at noon' (Pacific time).\n"
-        "Want to see a new feature for the bot? (It doesn't have to be poop-logging related) "
-        "/featurerequest to get started"
-    )
+    msg = await channel.send(poop_button_content())
     await msg.add_reaction(POOP_EMOJI)
     await msg.add_reaction(UNDO_EMOJI)
 
@@ -3808,6 +3812,16 @@ async def on_ready():
                 await post_button_for_guild(gid, cid)
             except (discord.Forbidden, discord.NotFound, discord.HTTPException):
                 continue
+        else:
+            active_message_id = gget(gid, "active_message_id")
+            if active_message_id:
+                try:
+                    channel = await bot.fetch_channel(cid)
+                    message = await channel.fetch_message(int(active_message_id))
+                    if message.author.id == bot.user.id:
+                        await message.edit(content=poop_button_content())
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    continue
 
     print(f"Logged in as {bot.user} (id={bot.user.id})")
 
