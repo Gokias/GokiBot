@@ -12,6 +12,7 @@ import socket
 import urllib.request
 from urllib.parse import urlparse
 import json
+import dateparser
 import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass, field
@@ -2237,6 +2238,115 @@ async def replay_event_from_history(
             return cur.rowcount > 0
 
 
+def parse_backdated_poop_time(text: str, reference: datetime) -> datetime:
+    """Parse one explicit time relative to the Discord message, in Pacific time."""
+    text = re.sub(r"^on\s+", "", text.strip().rstrip(".! ").lower())
+    if not text or len(text) > 200:
+        raise ValueError("Include when it happened, such as 'yesterday at noon'.")
+
+    # Never silently fill in an omitted time with the current clock time.
+    text = re.sub(r"\b([ap])\.m\.?", r"\1m", text)
+    clock = r"\b(?:noon|midnight|\d{1,2}(?::\d{2})?(?::\d{2})?\s*[ap]m|\d{1,2}:\d{2}(?::\d{2})?)\b"
+    relative = r"\b(?:seconds?|minutes?|hours?)\s+ago\b"
+    clock_values = re.findall(clock, text)
+    if not clock_values and not re.search(relative, text):
+        raise ValueError("Include a time, such as 'yesterday at noon' or '2 hours ago'.")
+    if len(clock_values) > 1:
+        raise ValueError("Please log one poop at a time, with one date and time.")
+    expected_clock = None
+    if clock_values:
+        value = clock_values[0]
+        if value in ("noon", "midnight"):
+            expected_clock = (12 if value == "noon" else 0, 0, 0)
+        else:
+            numbers = [int(part) for part in re.findall(r"\d+", value)]
+            hour, minute, second = (numbers + [0, 0])[:3]
+            meridiem = re.search(r"([ap])m$", value)
+            valid_hour = 1 <= hour <= 12 if meridiem else 0 <= hour <= 23
+            if minute > 59 or second > 59 or not valid_hour:
+                raise ValueError("That clock time isn't valid. Try 'yesterday at 3pm'.")
+            if meridiem:
+                hour = hour % 12 + (12 if meridiem.group(1) == "p" else 0)
+            expected_clock = (hour, minute, second)
+    if re.search(r"\bat\s+\d{1,2}(?![\d:])\s*$", text):
+        raise ValueError("Please include AM or PM, for example 'yesterday at 3pm'.")
+
+    reference = reference.astimezone(LOCAL_TZ)
+    # Resolve weekdays explicitly; strict parsing otherwise rejects these dates.
+    weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    match = re.match(r"(?:last\s+)?(" + "|".join(weekdays) + r")\b", text)
+    if match:
+        days = (reference.weekday() - weekdays.index(match.group(1))) % 7 or 7
+        text = (reference.date() - timedelta(days=days)).isoformat() + text[match.end():]
+    explicit_zone = re.search(r"\b(?:utc|gmt|pst|pdt)\b", text)
+    parsed = dateparser.parse(text, languages=["en"], settings={
+        "RELATIVE_BASE": reference,
+        "TIMEZONE": explicit_zone.group().upper() if explicit_zone else TZ_NAME,
+        "RETURN_AS_TIMEZONE_AWARE": True,
+        "PREFER_DATES_FROM": "past",
+        "STRICT_PARSING": True,
+        "PARSERS": ["relative-time", "absolute-time"],
+    })
+    if parsed is None:
+        raise ValueError("I couldn't read that date and time. Try 'yesterday at noon' or '2026-09-20 at 3pm'.")
+    if expected_clock and (parsed.hour, parsed.minute, parsed.second) != expected_clock:
+        raise ValueError("I couldn't read that clock time reliably. Try an exact date and time.")
+    local = parsed.astimezone(LOCAL_TZ)
+    # Reject local DST gaps and overlaps instead of guessing which instant was meant.
+    wall = parsed.replace(tzinfo=None)
+    if not re.search(r"\b(?:utc|gmt|pst|pdt)\b|[+-]\d{2}:?\d{2}\b", text):
+        first = wall.replace(tzinfo=LOCAL_TZ, fold=0)
+        second = wall.replace(tzinfo=LOCAL_TZ, fold=1)
+        if first.utcoffset() != second.utcoffset():
+            raise ValueError("That time falls in a daylight-saving clock change. Please specify a UTC time.")
+    utc = local.astimezone(timezone.utc)
+    if utc > reference.astimezone(timezone.utc):
+        raise ValueError("That time is in the future. Please give the time of a poop that already happened.")
+    return utc
+
+
+async def handle_backdated_poop_mention(message: discord.Message, bot_user_id: int) -> bool:
+    if message.guild is None:
+        return False
+    cfg = get_guild_config(message.guild.id)
+    if not cfg or int(cfg["channel_id"]) != message.channel.id:
+        return False
+    prompt = extract_bot_mention_prompt(message.content, bot_user_id)
+    match = re.fullmatch(
+        r"\s*(?:please\s+)?(?:i\s+pooped|log\s+(?:a\s+)?poop|add\s+(?:a\s+)?poop)\b(.*)",
+        prompt or "", re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return False
+    try:
+        timestamp = await asyncio.to_thread(parse_backdated_poop_time, match.group(1), message.created_at)
+    except (ValueError, OverflowError) as exc:
+        await send_message_reply(message, f"Nothing logged. {exc} Times default to Pacific ({TZ_NAME}).")
+        return True
+
+    # A redelivered Discord message must never create a second event.
+    event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"backdated-poop:{message.id}"))
+    try:
+        inserted = await replay_event_from_history(
+            event_id=event_id,
+            event_type="POOP",
+            created_at_utc=timestamp,
+            user_id=message.author.id,
+            username=str(message.author),
+            guild_id=message.guild.id,
+            channel_id=message.channel.id,
+            message_id=message.id,
+            note=f"backdated_from_message:{message.id}",
+        )
+    except sqlite3.Error:
+        await send_message_reply(message, "I couldn't save that poop to the database. Please try again.")
+        return True
+    local = timestamp.astimezone(LOCAL_TZ)
+    status = "Logged your poop for" if inserted else "This message already logged your poop for"
+    await send_message_reply(message, f"💩 {status} **{local:%Y-%m-%d at %I:%M %p %Z}**.")
+    return True
+
+
 async def log_cleanup_message(message: discord.Message):
     created_at = message.created_at.astimezone(timezone.utc)
     async with db_write_lock:
@@ -2675,6 +2785,7 @@ async def post_button_for_guild(guild_id: int, channel_id: int):
         f"💩 **Click here to log a poop** — {local_now.strftime('%Y-%m-%d')} (Pacific)\n"
         f"React {POOP_EMOJI} to log.\n"
         f"React {UNDO_EMOJI} to undo your most recent log.\n"
+        "Missed a log? Mention me with 'I pooped yesterday at noon' (Pacific time).\n"
         "Want to see a new feature for the bot? (It doesn't have to be poop-logging related) "
         "/featurerequest to get started"
     )
@@ -2765,7 +2876,8 @@ async def on_message(message: discord.Message):
         and message.content
         and message_mentions_bot_content(message.content, bot.user.id)
     ):
-        await handle_ai_mention(message, bot.user.id)
+        if not await handle_backdated_poop_mention(message, bot.user.id):
+            await handle_ai_mention(message, bot.user.id)
 
     await bot.process_commands(message)
 
@@ -3634,6 +3746,7 @@ async def gokibothelp(interaction: discord.Interaction):
     command_lines = [
         "**GokiBot Commands**",
         "- `/poopstats` — Show your poop stats for the year.",
+        "- `@PoopBot I pooped yesterday at noon` — Add a missed log in the poop channel (Pacific time). Also accepts `2 hours ago` or `last Friday at 3pm`.",
         "- `/wordlestats` — Show your Wordle stats.",
         "- `/featurerequest` — Start a feature request ticket.",
         "- `/collab` — Add someone to the current ticket thread.",
