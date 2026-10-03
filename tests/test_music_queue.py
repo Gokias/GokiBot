@@ -166,6 +166,20 @@ class MusicQueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_deliberate_stop_before_audio_does_not_retry(self):
         await self.assert_completion_does_not_retry(packets_read=0)
 
+    async def test_requested_skip_does_not_retry_when_empty_stream_reports_error(self):
+        track = self.track("first")
+        track.skip_requested = True
+        self.state.queue.append(track)
+        resolver = mock.AsyncMock()
+        with mock.patch.object(poopbot, "resolve_stream_selection", resolver), \
+                mock.patch.object(poopbot, "build_discord_audio_source", side_effect=self.make_source):
+            await poopbot.play_next_track(self.guild)
+            await self.finish(track, self.sources[0], RuntimeError("Stream failed during skip"))
+        resolver.assert_not_awaited()
+        self.assertEqual(track.stream_url_refresh_attempts, 0)
+        self.assertEqual(len(self.voice.played_sources), 1)
+        self.assertEqual(self.voice.disconnect_calls, 1)
+
     async def test_normal_completion_does_not_retry(self):
         await self.assert_completion_does_not_retry(packets_read=10)
 

@@ -4,10 +4,13 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
 import unittest
+
+import discord
 
 
 os.environ.setdefault("DISCORD_TOKEN", "test-token")
@@ -53,6 +56,7 @@ class MusicPlaybackTests(unittest.TestCase):
         cls.aac_file = Path(cls.audio_directory.name) / "tone.aac"
         cls.opus_file = Path(cls.audio_directory.name) / "tone.opus"
         cls.empty_opus_file = Path(cls.audio_directory.name) / "empty.opus"
+        cls.constant_pcm_file = Path(cls.audio_directory.name) / "constant.wav"
         subprocess.run(
             common_args + ["-c:a", "aac", "-f", "adts", str(cls.aac_file)],
             check=True,
@@ -67,6 +71,17 @@ class MusicPlaybackTests(unittest.TestCase):
         )
         subprocess.run(
             common_args + ["-t", "0", "-c:a", "libopus", str(cls.empty_opus_file)],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+        subprocess.run(
+            [
+                shutil.which("ffmpeg"),
+                "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-f", "lavfi", "-i", "aevalsrc=0.1:s=48000:d=0.3",
+                "-ac", "2", "-c:a", "pcm_s16le", str(cls.constant_pcm_file),
+            ],
             check=True,
             capture_output=True,
             timeout=15,
@@ -94,22 +109,39 @@ class MusicPlaybackTests(unittest.TestCase):
         self.addCleanup(source.cleanup)
         return source
 
-    def read_packets(self, source):
-        packets = []
-        while packet := source.read():
-            packets.append(packet)
-        self.assertGreater(len(packets), 2, "FFmpeg must produce playable audio")
-        self.assertTrue(source.is_opus())
+    def read_pcm_frames_and_check_encoding(self, source):
+        frames = []
+        while frame := source.read():
+            frames.append(frame)
+        self.assertGreater(len(frames), 2, "FFmpeg must produce playable audio")
+        self.assertFalse(source.is_opus())
+        # 48 kHz, 20 ms, stereo, 16-bit PCM: 960 * 2 * 2 bytes.
+        self.assertEqual({len(frame) for frame in frames}, {3840})
+        encoder = discord.opus.Encoder()
+        packets = [encoder.encode(frame, 960) for frame in frames]
         self.assertEqual({opus_packet_duration_ms(packet) for packet in packets}, {20})
-        return packets
+        return frames
 
-    def test_http_aac_is_transcoded_to_20ms_opus_packets(self):
+    def test_http_aac_produces_20ms_pcm_frames_for_discord_encoding(self):
         source = self.make_source("tone.aac", "aac")
-        self.read_packets(source)
+        self.read_pcm_frames_and_check_encoding(source)
 
-    def test_http_60ms_opus_is_transcoded_to_20ms_packets(self):
+    def test_http_60ms_opus_produces_20ms_pcm_frames_for_discord_encoding(self):
         source = self.make_source("tone.opus", "opus")
-        self.read_packets(source)
+        self.read_pcm_frames_and_check_encoding(source)
+
+    def test_volume_reduces_real_pcm_amplitude_to_half_then_silence(self):
+        source = self.make_source("constant.wav", "pcm_s16le")
+        amplitudes = []
+        for volume in (1.0, 0.5, 0.0):
+            source.volume = volume
+            frame = source.read()
+            self.assertEqual(len(frame), 3840)
+            samples = struct.unpack("<1920h", frame)
+            amplitudes.append(max(abs(sample) for sample in samples))
+        self.assertGreater(amplitudes[0], 1000)
+        self.assertAlmostEqual(amplitudes[1] / amplitudes[0], 0.5, delta=0.001)
+        self.assertEqual(amplitudes[2], 0)
 
     def test_missing_http_audio_raises_instead_of_silent_completion(self):
         source = self.make_source("missing.aac", "aac")

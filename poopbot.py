@@ -222,6 +222,8 @@ WESROTH_CAPTIONS = [
 ]
 
 FETCH_TRACK_INFO_TIMEOUT_SECONDS = 25
+SKIP_FADE_DURATION_SECONDS = 2.0
+SKIP_FADE_UPDATE_SECONDS = 0.02
 FETCH_TRACK_INFO_TIMEOUT_MESSAGE = (
     "Timed out while fetching track info for that link or search. Please try again in a moment."
 )
@@ -1075,6 +1077,7 @@ class QueueTrack:
     audio_codec: str | None = None
     stream_url_refresh_attempts: int = 0
     http_headers: dict[str, str] = field(default_factory=dict)
+    skip_requested: bool = False
     stream_url_task: asyncio.Task["StreamSelection"] | None = field(default=None, init=False, repr=False, compare=False)
 
 
@@ -1086,6 +1089,8 @@ class GuildMusicState:
         self.lock = asyncio.Lock()
         self.playback_lock = asyncio.Lock()
         self.playlist_tasks: set[asyncio.Task] = set()
+        self.fade_task: asyncio.Task | None = None
+        self.fade_source: MusicAudioSource | None = None
 
 
 music_states: dict[int, GuildMusicState] = {}
@@ -1615,39 +1620,70 @@ def build_ffmpeg_before_options(source_url: str, http_headers: dict[str, str] | 
     return " ".join(parts)
 
 
-class MusicAudioSource(discord.FFmpegOpusAudio):
-    def __init__(self, *args, **kwargs):
+class MusicAudioSource(discord.PCMVolumeTransformer):
+    def __init__(self, original: discord.AudioSource):
         self.audio_packets_read = 0
-        super().__init__(*args, **kwargs)
+        super().__init__(original, volume=1.0)
 
     def read(self) -> bytes:
         packet = super().read()
-        while packet.startswith((b"OpusHead", b"OpusTags")):
-            packet = super().read()
         if packet:
             self.audio_packets_read += 1
-        elif self.audio_packets_read == 0:
-            raise RuntimeError("FFmpeg returned no audio. The media stream may have expired or failed to open.")
+        else:
+            source_error = getattr(self.original, "_current_error", None)
+            if self.audio_packets_read == 0:
+                raise RuntimeError("FFmpeg returned no audio. The media stream may have expired or failed to open.") from source_error
+            if source_error is not None:
+                raise source_error
         return packet
 
     def cleanup(self):
-        stdout = getattr(self, "_stdout", None)
+        stdout = getattr(getattr(self, "original", None), "_stdout", None)
         try:
-            super().cleanup()
+            if hasattr(self, "original"):
+                super().cleanup()
         finally:
             if hasattr(stdout, "close"):
                 stdout.close()
 
 
 def build_discord_audio_source(track: QueueTrack, stream_url: str) -> MusicAudioSource:
-    # discord.py interprets codec='libopus' as permission to copy the input.
-    # Re-encode with codec=None so AAC also works and every packet lasts 20ms.
-    return MusicAudioSource(
+    # PCM permits live volume changes; Discord encodes each 20ms frame to Opus.
+    return MusicAudioSource(discord.FFmpegPCMAudio(
         stream_url,
-        codec=None,
         before_options=build_ffmpeg_before_options(track.source_url, track.http_headers),
-        options="-vn -frame_duration 20",
-    )
+        options="-vn",
+    ))
+
+
+async def fade_out_track(
+    guild: discord.Guild,
+    voice_client: discord.VoiceClient,
+    source: MusicAudioSource,
+    *,
+    duration_seconds: float = SKIP_FADE_DURATION_SECONDS,
+):
+    state = get_music_state(guild.id)
+    started_at = time.perf_counter()
+    initial_volume = source.volume
+    try:
+        while (
+            guild.voice_client is voice_client
+            and voice_client.is_connected()
+            and voice_client.source is source
+            and voice_client.is_playing()
+        ):
+            elapsed = time.perf_counter() - started_at
+            progress = min(elapsed / duration_seconds, 1.0) if duration_seconds > 0 else 1.0
+            source.volume = initial_volume * (1.0 - progress)
+            if progress >= 1.0:
+                voice_client.stop()
+                return
+            await asyncio.sleep(min(SKIP_FADE_UPDATE_SECONDS, duration_seconds - elapsed))
+    finally:
+        if state.fade_task is asyncio.current_task():
+            state.fade_task = None
+            state.fade_source = None
 
 
 async def play_next_track(guild: discord.Guild, retry_track: QueueTrack | None = None):
@@ -1671,7 +1707,8 @@ async def _finish_music_track(
         retry_track = None
         if play_error:
             print(f"Playback error for '{track.title}': {play_error}")
-            if audio_source.audio_packets_read == 0 and track.stream_url_refresh_attempts == 0:
+            if (not track.skip_requested and audio_source.audio_packets_read == 0
+                    and track.stream_url_refresh_attempts == 0):
                 track.stream_url_refresh_attempts += 1
                 track.stream_url = None
                 track.stream_url_task = None
@@ -3616,9 +3653,7 @@ async def gqueue(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-@app_commands.guild_only()
-@bot.tree.command(name="gskip", description="Skip the currently playing track.")
-async def gskip(interaction: discord.Interaction):
+async def get_skip_voice_client(interaction: discord.Interaction) -> discord.VoiceClient | None:
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
@@ -3647,8 +3682,74 @@ async def gskip(interaction: discord.Interaction):
         await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
         return
 
+    return vc
+
+
+@app_commands.guild_only()
+@bot.tree.command(name="gskip", description="Skip the currently playing track.")
+async def gskip(interaction: discord.Interaction):
+    vc = await get_skip_voice_client(interaction)
+    if vc is None:
+        return
+
+    state = get_music_state(interaction.guild.id)
+    if state.current_track is not None:
+        state.current_track.skip_requested = True
+    if state.fade_task is not None:
+        state.fade_task.cancel()
     vc.stop()
     await interaction.response.send_message("⏭️ Skipped current track.", ephemeral=True)
+
+
+@app_commands.guild_only()
+@bot.tree.command(name="gskipfade", description="Fade out the current track over two seconds, then skip it.")
+async def gskipfade(interaction: discord.Interaction):
+    vc = await get_skip_voice_client(interaction)
+    if vc is None:
+        return
+
+    state = get_music_state(interaction.guild.id)
+    if vc.is_paused():
+        if state.current_track is not None:
+            state.current_track.skip_requested = True
+        if state.fade_task is not None:
+            state.fade_task.cancel()
+        vc.stop()
+        await interaction.response.send_message("⏭️ Skipped the paused track.", ephemeral=True)
+        return
+
+    source = vc.source
+    if not isinstance(source, MusicAudioSource):
+        await interaction.response.send_message(
+            "This audio source cannot fade. Use `/gskip` to skip it immediately.", ephemeral=True,
+        )
+        return
+
+    if state.fade_task is not None and not state.fade_task.done():
+        if state.fade_source is source:
+            await interaction.response.send_message("The current track is already fading out.", ephemeral=True)
+            return
+        state.fade_task.cancel()
+
+    if state.current_track is not None:
+        state.current_track.skip_requested = True
+    state.fade_source = source
+    state.fade_task = asyncio.create_task(fade_out_track(interaction.guild, vc, source))
+
+    def _log_fade_failure(completed):
+        if state.fade_task is completed:
+            state.fade_task = None
+            state.fade_source = None
+        if completed.cancelled():
+            return
+        error = completed.exception()
+        if error is not None:
+            print(f"Failed to fade out track: {error}")
+
+    state.fade_task.add_done_callback(_log_fade_failure)
+    await interaction.response.send_message(
+        "🔉 Fading out the current track over 2 seconds, then skipping.", ephemeral=True,
+    )
 
 
 @bot.tree.command(
@@ -3867,6 +3968,7 @@ async def gokibothelp(interaction: discord.Interaction):
         "- `/gplay <link_or_search>` — Queue and play audio from a link or search term.",
         "- `/gqueue` — Show the current playback queue.",
         "- `/gskip` — Skip the currently playing track.",
+        "- `/gskipfade` — Fade out the current track over 2 seconds, then skip it.",
         "- `/gokibothelp` — Show this help message."
     ]
 
